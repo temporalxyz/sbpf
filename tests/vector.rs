@@ -165,7 +165,12 @@ enum Input {
     Gapped,
     /// Writable, mapped at MM_INPUT_START + 64
     Shifted,
+    /// Writable, two regions back to back, the second at MM_INPUT_START + [SPLIT]
+    Split,
 }
+
+/// Size of the first region of [Input::Split], also the region size of the aligned mapping
+const SPLIT: usize = 1 << 20;
 
 fn run(
     executable: &Executable<TestContextObject>,
@@ -195,6 +200,10 @@ fn run(
             MemoryRegion::new(&raw mut memory[..], ebpf::MM_INPUT_START + 64),
             None,
         ),
+        Input::Split => (
+            MemoryRegion::new(&raw mut memory[..SPLIT], ebpf::MM_INPUT_START),
+            None,
+        ),
         Input::CopyOnWrite => {
             let mut region = MemoryRegion::new(&raw const memory[..], ebpf::MM_INPUT_START);
             region.access_violation_handler_payload = Some(1);
@@ -214,6 +223,13 @@ fn run(
             (region, Some(handler))
         }
     };
+    let mut regions = vec![region];
+    if kind == Input::Split {
+        regions.push(MemoryRegion::new(
+            &raw mut memory[SPLIT..],
+            ebpf::MM_INPUT_START + SPLIT as u64,
+        ));
+    }
     let mut call_frames = vec![CallFrame::default(); executable.get_config().max_call_depth];
     let (instruction_count, result, pc, vector_registers) = {
         create_vm!(
@@ -222,7 +238,7 @@ fn run(
             &mut context_object,
             stack,
             heap,
-            vec![region],
+            regions,
             handler
         );
         let (instruction_count, result) = vm.execute_program(
@@ -1838,56 +1854,80 @@ fn test_masked_memory_faults() {
     }
 }
 
-/// ldn and stn translate the whole span once: it must lie in one region
+/// ldn and stn are n single accesses in ascending order: the first failing one ends the op with
+/// its error, the ones before it take effect
 #[test]
 fn test_multi_register_memory_faults() {
     let input: Vec<u8> = input_pattern(200);
     for aligned in [false, true] {
-        for (op, n, offset, kind, expected) in [
-            (op::LDN, 3, 8, Input::Writable, "Ok("),
+        // (op, n, offset, kind, error, accesses before the failing one)
+        for (op, n, offset, kind, expected, done) in [
+            (op::LDN, 3, 8, Input::Writable, "Ok(", 3),
             (
                 op::LDN,
                 3,
                 9,
                 Input::Writable,
-                "AccessViolation(Load, 17179869193, 192",
+                "AccessViolation(Load, 17179869321, 64",
+                2,
             ),
             (
                 op::LDN,
                 2,
                 64,
                 Input::Gapped,
-                "AccessViolation(Load, 17179869248, 128",
+                "AccessViolation(Load, 17179869248, 64",
+                0,
+            ),
+            (
+                op::LDN,
+                2,
+                0,
+                Input::Gapped,
+                "AccessViolation(Load, 17179869248, 64",
+                1,
             ),
             (
                 op::LDN,
                 2,
                 -64i64 as u64,
                 Input::Writable,
-                "AccessViolation(Load, 17179869120, 128",
+                "AccessViolation(Load, 17179869120, 64",
+                0,
             ),
-            (op::STN, 2, 72, Input::Writable, "Ok("),
+            (op::STN, 2, 72, Input::Writable, "Ok(", 2),
             (
                 op::STN,
                 2,
                 73,
                 Input::Writable,
-                "AccessViolation(Store, 17179869257, 128",
+                "AccessViolation(Store, 17179869321, 64",
+                1,
+            ),
+            (
+                op::STN,
+                2,
+                0,
+                Input::Gapped,
+                "AccessViolation(Store, 17179869248, 64",
+                1,
             ),
             (
                 op::STN,
                 3,
                 0,
                 Input::ReadOnly,
-                "AccessViolation(Store, 17179869184, 192",
+                "AccessViolation(Store, 17179869184, 64",
+                0,
             ),
-            (op::STN, 3, 4, Input::CopyOnWrite, "Ok("),
+            (op::STN, 3, 4, Input::CopyOnWrite, "Ok(", 3),
             (
                 op::STN,
                 2,
                 0,
                 Input::Shifted,
-                "AccessViolation(Store, 17179869184, 128",
+                "AccessViolation(Store, 17179869184, 64",
+                0,
             ),
         ] {
             for off in [0i16, 1, -1, 0x400] {
@@ -1923,35 +1963,120 @@ fn test_multi_register_memory_faults() {
                 let before = instruction_count(&words[..pc]);
                 if expected.starts_with("Ok(") {
                     assert_eq!(outcome.instruction_count, before + n as u64 + 2);
-                    if op == op::LDN {
-                        for k in 0..n as usize {
-                            let start = offset as usize + 64 * k;
-                            assert_eq!(outcome.vector_registers[1 + k].0, input[start..start + 64]);
-                        }
-                    } else {
-                        let start = offset as usize;
-                        for k in 0..n as usize {
-                            assert_eq!(
-                                &outcome.memory[start + 64 * k..start + 64 * (k + 1)],
-                                &outcome.vector_registers[1 + k].0[..]
-                            );
-                        }
-                    }
                 } else {
                     assert_eq!(
                         (outcome.pc, outcome.instruction_count),
                         (pc as u64, before + n as u64)
                     );
-                    for k in 1..5 {
-                        if k != 2 {
-                            assert_eq!(
-                                outcome.vector_registers[k].0,
-                                PRELOADED.to_le_bytes().repeat(8)[..]
-                            );
-                        }
-                    }
-                    assert_eq!(outcome.memory, input);
                 }
+                let mut expected_memory = input.clone();
+                for k in 0..4 {
+                    let start = (offset as usize).wrapping_add(64 * k);
+                    if op == op::LDN && k < done {
+                        assert_eq!(outcome.vector_registers[1 + k].0, input[start..start + 64]);
+                    } else if k != 1 {
+                        assert_eq!(
+                            outcome.vector_registers[1 + k].0,
+                            PRELOADED.to_le_bytes().repeat(8)[..]
+                        );
+                    }
+                    if op == op::STN && k < done {
+                        expected_memory[start..start + 64]
+                            .copy_from_slice(&outcome.vector_registers[1 + k].0);
+                    }
+                }
+                assert_eq!(outcome.memory, expected_memory);
+            }
+        }
+    }
+}
+
+/// An ldn or stn across two regions back to back, alone and in a memory run, which faults at
+/// the first register not inside one of them
+#[test]
+fn test_multi_register_split_regions() {
+    let input = input_pattern(SPLIT + 160);
+    // (first register at SPLIT + start, n, accesses before the failing one)
+    for (start, n, done) in [
+        (-128i64, 4, 4),
+        (-64, 2, 2),
+        (-128, 5, 4),
+        (-160, 4, 2),
+        (96, 2, 1),
+        (160, 2, 0),
+    ] {
+        for op in [op::LDN, op::STN] {
+            for in_run in [false, true] {
+                let mut words = preload(1..6);
+                let address = (SPLIT as i64 + start) as usize;
+                let off = 0x400;
+                words.extend(lddw(1, ebpf::MM_INPUT_START + address as u64 - off as u64));
+                if in_run {
+                    words.push(ld(20, off - 64));
+                }
+                words.push(vop(op::INSERT_Q, 3, 2, 0, 0));
+                words.push(encode_with_offset(
+                    op,
+                    n,
+                    if op == op::LDN { 1 } else { 0 },
+                    if op == op::STN { 1 } else { 0 },
+                    0,
+                    off,
+                ));
+                words.push(mov64_imm(0, 7));
+                words.push(exit());
+                let pc = words.len() - 3;
+                let before = instruction_count(&words[..pc]);
+                let mut outcomes = vec![];
+                for aligned in [false, true] {
+                    let executable = verified(
+                        &words,
+                        Config {
+                            aligned_region_size: SPLIT,
+                            ..config(true, aligned)
+                        },
+                    );
+                    outcomes.push(run_both(&executable, &input, Input::Split, 1000));
+                    if in_run && aligned && memory_runs_available() {
+                        assert!(inside_memory_run(&executable, pc));
+                    }
+                }
+                let outcome = outcomes.pop().unwrap();
+                assert_eq!(outcomes[0].memory, outcome.memory);
+                assert_eq!(outcomes[0].vector_registers, outcome.vector_registers);
+                assert_eq!(outcomes[0].pc, outcome.pc);
+                if done == n as usize {
+                    assert_eq!(outcome.result, "Ok(7)", "{start} {n}");
+                    assert_eq!(outcome.instruction_count, before + n as u64 + 2);
+                } else {
+                    let error = format!(
+                        "AccessViolation({}, {}, 64",
+                        if op == op::LDN { "Load" } else { "Store" },
+                        ebpf::MM_INPUT_START + (address + 64 * done) as u64
+                    );
+                    assert!(
+                        outcome.result.contains(&error),
+                        "{} {} {:?}",
+                        start,
+                        n,
+                        outcome
+                    );
+                    assert_eq!(
+                        (outcome.pc, outcome.instruction_count),
+                        (pc as u64, before + n as u64)
+                    );
+                }
+                let mut expected_memory = input.clone();
+                for k in 0..done {
+                    let at = address + 64 * k;
+                    if op == op::LDN {
+                        assert_eq!(outcome.vector_registers[1 + k].0, input[at..at + 64]);
+                    } else {
+                        expected_memory[at..at + 64]
+                            .copy_from_slice(&outcome.vector_registers[1 + k].0);
+                    }
+                }
+                assert_eq!(outcome.memory, expected_memory);
             }
         }
     }
