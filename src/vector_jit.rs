@@ -17,9 +17,10 @@
 //!   not gapped, permitted). Everything else goes to [MemoryMapping::map_with_access_violation_handler]
 //!   which is exactly what the scalar path calls. So results, errors and CUs match.
 //! - A run of vector ops with several memory accesses translates the address range they cover
-//!   once, see [MemoryRuns]. `ldn` and `stn` translate their span with the same subroutine.
-//! - Accesses which are not plain, and gathers and scatters whose lanes are not in one plain
-//!   region, run the interpreter semantics in [vector_slow_path].
+//!   once, see [MemoryRuns]. `ldn` and `stn` translate their span with the same subroutine, if
+//!   it is not plain they translate each register's access on its own, like single `ld` / `st`.
+//! - Gathers and scatters whose lanes are not in one plain region run the interpreter semantics
+//!   in [vector_slow_path].
 
 use super::*;
 use crate::{
@@ -118,9 +119,8 @@ extern "C" fn translate_slow_path(
     };
 }
 
-/// Slow path of the ops the JIT does not (always) translate inline: `ldn`, `stn` and gathers and
-/// scatters. Executes the op like the interpreter (without CUs) and writes the result to
-/// [EbpfVm::program_result].
+/// Slow path of gathers and scatters. Executes the op like the interpreter (without CUs) and
+/// writes the result to [EbpfVm::program_result].
 extern "C" fn vector_slow_path<C: ContextObject>(
     mut vm: EncryptedHostAddressToEbpfVm<C>,
     r1: u64,
@@ -1004,7 +1004,8 @@ pub(super) fn max_machine_code_length(v: &VectorInsn, registers_used: u32) -> us
         // The access in a run and its fallback
         length += RUN + ACCESS + instructions;
         if !TRANSLATION_LENGTHS.contains(&len) {
-            length += ACCESS + host_call;
+            // One access per register
+            length += lowering.instructions.len() * (ACCESS + PER_INSTRUCTION);
         }
     }
     if matches!(v.info.kind, Kind::Ga | Kind::Sc) {
@@ -1175,9 +1176,9 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             }
             return;
         }
-        // ldn and stn: the span translation, the slow path if the span is not plain
+        // ldn and stn: the span translation, one access per register if the span is not plain
         let Some(span_translation) = self.inline_span_translation() else {
-            self.emit_vector_slow_path_call(v, pc);
+            self.emit_vector_register_accesses(v, lowering, pc);
             return;
         };
         let key = self.memory_run_key();
@@ -1204,8 +1205,22 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         let done = self.offset_in_text_section + 1;
         self.emit_ins(X86Instruction::jump_immediate(0));
         self.patch_rel32(slow_path);
-        self.emit_vector_slow_path_call(v, pc);
+        self.emit_vector_register_accesses(v, lowering, pc);
         self.patch_rel32(done);
+    }
+
+    /// `ldn` and `stn` as single register accesses in ascending order, each translated on its own
+    fn emit_vector_register_accesses(&mut self, v: &VectorInsn, lowering: &Lowering, pc: usize) {
+        let (access_type, _) = lowering.memory.unwrap();
+        for (k, instruction) in lowering.instructions.iter().enumerate() {
+            let HostInstruction::Evex(evex) = instruction else {
+                unreachable!("ldn and stn are vmovdqu64 only");
+            };
+            let off = v.off as i64 + (k * VECTOR_SIZE) as i64;
+            self.emit_vm_address(REGISTER_MAP[1], off, true);
+            self.emit_vector_translation_call(access_type, VECTOR_SIZE as u64, pc);
+            self.emit_host_instruction(&HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, 0)));
+        }
     }
 
     /// The span translation subroutines, if the region layout and the mapping allow them

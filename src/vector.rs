@@ -2012,7 +2012,8 @@ pub(crate) fn gather_scatter<C: ContextObject>(
 
 /// Interprets one vector op, `reg` are the scalar registers of the interpreter
 ///
-/// On error nothing (vector registers, scalar registers or memory) has been modified.
+/// On error nothing (vector registers, scalar registers or memory) has been modified, except by
+/// the accesses of an `ldn` or `stn` before the failing one.
 pub(crate) fn execute<C: ContextObject>(
     vm: &mut EbpfVm<C>,
     reg: &mut [u64; 12],
@@ -2036,8 +2037,8 @@ pub(crate) fn execute<C: ContextObject>(
 
 /// The effect of a vector op, without its CUs. Returns the new value of `r0` if the op writes it.
 ///
-/// Also the slow path of the JIT for the memory ops it does not translate inline. On error nothing
-/// has been modified.
+/// Also the slow path of the JIT for gathers and scatters. On error nothing has been modified,
+/// except by the accesses of an `ldn` or `stn` before the failing one.
 pub(crate) fn execute_decoded<C: ContextObject>(
     vm: &mut EbpfVm<C>,
     v: &VectorInsn,
@@ -2068,11 +2069,13 @@ pub(crate) fn execute_decoded<C: ContextObject>(
             op::LDBC_W => 2,
             op::LD_X | op::ST_X | op::LDBC_X => 16,
             op::LD_Y | op::ST_Y | op::LDBC_Y => 32,
-            _ => VECTOR_SIZE * count,
+            _ => VECTOR_SIZE,
         };
+        // `ldn` and `stn` are `count` accesses of one register each, in ascending order
+        let vm_addr = |k: usize| vm_addr.wrapping_add((k * VECTOR_SIZE) as u64);
         if matches!(info.kind, Kind::St | Kind::Sti) {
-            let host_addr = translate(vm, AccessType::Store, vm_addr, len as u64)?;
             if op == op::ST_M {
+                let host_addr = translate(vm, AccessType::Store, vm_addr(0), len as u64)?;
                 let bytes = info.mask_lane_bytes(imm8);
                 let value = vm.vector_registers[in0];
                 for i in (0..VECTOR_SIZE / bytes).filter(|i| (r2 >> i) & 1 == 1) {
@@ -2087,29 +2090,18 @@ pub(crate) fn execute_decoded<C: ContextObject>(
                 }
             } else {
                 for k in 0..count {
+                    let host_addr = translate(vm, AccessType::Store, vm_addr(k), len as u64)?;
                     let value = vm.vector_registers[in0 + k];
                     // SAFETY: `translate` checked that `len` bytes at `host_addr` are mapped writable.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            value.0.as_ptr(),
-                            host_addr.add(k * VECTOR_SIZE),
-                            len / count,
-                        )
-                    };
+                    unsafe { std::ptr::copy_nonoverlapping(value.0.as_ptr(), host_addr, len) };
                 }
             }
         } else {
-            let host_addr = translate(vm, AccessType::Load, vm_addr, len as u64)?;
             for k in 0..count {
+                let host_addr = translate(vm, AccessType::Load, vm_addr(k), len as u64)?;
                 let mut bytes = [0u8; VECTOR_SIZE];
                 // SAFETY: `translate` checked that `len` bytes at `host_addr` are mapped readable.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        host_addr.add(k * VECTOR_SIZE),
-                        bytes.as_mut_ptr(),
-                        len / count,
-                    )
-                };
+                unsafe { std::ptr::copy_nonoverlapping(host_addr, bytes.as_mut_ptr(), len) };
                 let element = VectorRegister(bytes);
                 let result = match op {
                     op::LDBC_D => map1::<4>(&V::ZERO, |_| element.lane::<4>(0)),
