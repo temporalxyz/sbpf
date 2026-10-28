@@ -156,6 +156,10 @@ enum Input {
     ReadOnly,
     /// Read-only, the access violation handler makes it writable on the first store
     CopyOnWrite,
+    /// Writable, 64 byte frames with 64 byte gaps in between
+    Gapped,
+    /// Writable, mapped at MM_INPUT_START + 64
+    Shifted,
 }
 
 fn run(
@@ -175,6 +179,14 @@ fn run(
         ),
         Input::ReadOnly => (
             MemoryRegion::new(&raw const memory[..], ebpf::MM_INPUT_START),
+            None,
+        ),
+        Input::Gapped => (
+            MemoryRegion::new_gapped(&raw mut memory[..], ebpf::MM_INPUT_START, 64),
+            None,
+        ),
+        Input::Shifted => (
+            MemoryRegion::new(&raw mut memory[..], ebpf::MM_INPUT_START + 64),
             None,
         ),
         Input::CopyOnWrite => {
@@ -906,6 +918,468 @@ fn test_vector_registers_across_whole_file() {
     let executable = verified(&words, config(true, true));
     let outcome = run_both(&executable, &[], Input::Writable, 1000);
     assert_eq!(outcome.result, format!("Ok({})", 8 * (1..=30).sum::<u64>()));
+}
+
+// Memory runs: consecutive vector ops with several accesses share one address translation in the
+// JIT (aligned memory mapping only)
+
+fn jump(opc: u8, dst: u8, imm: i32, off: i16) -> u64 {
+    insn(opc, dst, 0, off, imm)
+}
+fn ld(out: u8, off: i16) -> u64 {
+    encode_with_offset(op::LD, 0, out, 0, 0, off)
+}
+fn st(in0: u8, off: i16) -> u64 {
+    encode_with_offset(op::ST, 0, 0, in0, 0, off)
+}
+fn ldbc_d(out: u8, off: i16) -> u64 {
+    encode_with_offset(op::LDBC_D, 0, out, 0, 0, off)
+}
+fn ldbc_q(out: u8, off: i16) -> u64 {
+    encode_with_offset(op::LDBC_Q, 0, out, 0, 0, off)
+}
+
+fn run_config(aligned: bool, checkpoint_distance: usize) -> Config {
+    Config {
+        instruction_meter_checkpoint_distance: checkpoint_distance,
+        ..config(true, aligned)
+    }
+}
+
+/// Whether the JIT turned the instruction at `pc` into the inside of a memory run: callx and
+/// jumps to it then enter through `xor r11d, r11d; jmp`
+fn inside_memory_run(executable: &Executable<TestContextObject>, pc: usize) -> bool {
+    let program = executable.get_compiled_program().unwrap();
+    let code = &program.text_section()[program.pc_section()[pc] as usize..];
+    code.starts_with(&[0x45, 0x31, 0xdb, 0xe9]) || code.starts_with(&[0x45, 0x31, 0xdb, 0x90, 0xe9])
+}
+
+/// Whether the JIT emits memory runs (the tracer disables them)
+fn memory_runs_available() -> bool {
+    jit_available() && !cfg!(feature = "tracer")
+}
+
+/// Runs the program in the interpreter and the JIT with both memory mappings and checks they all
+/// agree. With the unaligned mapping the JIT emits no memory runs and checks the instruction meter
+/// at the same accesses, so the JIT vector registers must agree even if it runs out.
+fn run_with_and_without_memory_runs(
+    words: &[u64],
+    input: &[u8],
+    kind: Input,
+    budget: u64,
+    checkpoint_distance: usize,
+) -> Outcome {
+    let mut outcomes = vec![];
+    for aligned in [false, true] {
+        let executable = verified(words, run_config(aligned, checkpoint_distance));
+        let interpreted = run_both(&executable, input, kind, budget);
+        let jitted = jit_available().then(|| run(&executable, input, kind, budget, true));
+        outcomes.push((interpreted, jitted));
+    }
+    let (with_runs, without_runs) = (outcomes.pop().unwrap(), outcomes.pop().unwrap());
+    assert_eq!(
+        without_runs.0, with_runs.0,
+        "the mapping changed the result"
+    );
+    assert_eq!(
+        without_runs.1, with_runs.1,
+        "memory runs changed the JIT result"
+    );
+    with_runs.0
+}
+
+fn input_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + 3) as u8).collect()
+}
+
+fn broadcast<const N: usize>(bytes: &[u8]) -> Vec<u8> {
+    bytes[..N].repeat(64 / N)
+}
+
+/// A run which faults at one of its accesses: the earlier ones take effect, the error, pc and CUs
+/// are those of the faulting access
+#[test]
+fn test_memory_run_faults() {
+    let input = input_pattern(200);
+    // (r1, displacement of the last access, faulting access, expected error)
+    let cases: [(i64, i16, Option<usize>, &str); 7] = [
+        (0, 136, None, "Ok(9)"),
+        (
+            0,
+            137,
+            Some(3),
+            "AccessViolation(Store, 17179869321, 64, \"input\")",
+        ),
+        (
+            0,
+            150,
+            Some(3),
+            "AccessViolation(Store, 17179869334, 64, \"input\")",
+        ),
+        // Below the start of the input region (a different region index)
+        (
+            0,
+            -1,
+            Some(3),
+            "AccessViolation(Store, 17179869183, 64, \"unallocated\")",
+        ),
+        // r1 beyond the end: the first access faults
+        (
+            200,
+            -200,
+            Some(0),
+            "AccessViolation(Store, 17179869384, 64, \"unallocated\")",
+        ),
+        // The span covers both sides of the end, the accesses do not cross it
+        (64, 8, Some(2), "AccessViolation(Load, 17179869380, 8"),
+        (-64, 64, None, "Ok(9)"),
+    ];
+    for (r1, last, faulting, expected) in cases {
+        let mut words = vec![mov64_reg(6, 1), vop(op::SPLAT_Q, 0, 1, 0, 0)];
+        words.push(add64_imm(1, r1 as i32));
+        let run_start = words.len();
+        words.extend([
+            st(1, 0),
+            ld(2, if r1 == 64 { -64 } else { 64 }),
+            ldbc_q(3, if r1 == 64 { 132 } else { 100 }),
+            st(2, last),
+            mov64_imm(0, 9),
+            exit(),
+        ]);
+        if r1 == -64 {
+            // All accesses above the start, the first displacement is not the smallest
+            words[run_start] = st(1, 64);
+            words[run_start + 1] = ld(2, 128);
+            words[run_start + 2] = ldbc_q(3, 164);
+        }
+        let outcome = run_with_and_without_memory_runs(&words, &input, Input::Writable, 100, 1000);
+        assert!(
+            outcome.result.contains(expected),
+            "{r1} {last}: {}",
+            outcome.result
+        );
+        if let Some(access) = faulting {
+            assert_eq!(outcome.pc, (run_start + access) as u64, "{r1} {last}");
+            assert_eq!(outcome.instruction_count, (run_start + access + 1) as u64);
+        }
+        if faulting.is_none_or(|access| access > 0) && r1 == 0 {
+            let r1_bytes = ebpf::MM_INPUT_START.to_le_bytes().repeat(8);
+            assert_eq!(&outcome.memory[..64], &r1_bytes[..]);
+            assert_eq!(outcome.vector_registers[2].0, input[64..128]);
+            assert_eq!(
+                outcome.vector_registers[3].0[..],
+                broadcast::<8>(&input[100..])[..]
+            );
+        }
+        if memory_runs_available() {
+            let executable = verified(&words, run_config(true, 1000));
+            executable.jit_compile().unwrap();
+            assert!(inside_memory_run(&executable, run_start + 1));
+        }
+    }
+}
+
+/// Runs in every kind of region: stores to read-only memory fault, stores to copy-on-write memory
+/// redirect the region in the middle of a run, gaps and a region which does not start at its
+/// region index fault like single accesses
+#[test]
+fn test_memory_run_region_kinds() {
+    let input = input_pattern(256);
+    let words = [
+        mov64_reg(6, 1),
+        vop(op::SPLAT_Q, 0, 7, 0, 0),
+        // Loads only: one translation even for read-only and copy-on-write
+        ld(1, 0),
+        ldbc_d(2, 132),
+        ld(3, 128),
+        // A store, then loads in the same run see the copy
+        st(7, 64),
+        ld(4, 64),
+        ld(5, 0),
+        st(5, 192),
+        ld(6, 192),
+        // Scalar store, then a load only run sees the redirected region
+        insn(ebpf::ST_B_IMM, 1, 0, 1, 0x5a),
+        ld(8, 0),
+        ldbc_q(9, 1),
+        vop(op::HSUM_D, 0, 0, 6, 0),
+        exit(),
+    ];
+    for kind in [
+        Input::Writable,
+        Input::ReadOnly,
+        Input::CopyOnWrite,
+        Input::Gapped,
+        Input::Shifted,
+    ] {
+        for budget in [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 100] {
+            let outcome = run_with_and_without_memory_runs(&words, &input, kind, budget, 1000);
+            match (kind, budget) {
+                (_, 100) if kind == Input::Writable || kind == Input::CopyOnWrite => {
+                    assert!(outcome.result.starts_with("Ok("), "{}", outcome.result);
+                    let mut expected = input.clone();
+                    expected[64..128]
+                        .copy_from_slice(&ebpf::MM_INPUT_START.to_le_bytes().repeat(8));
+                    let mut v5 = input[..64].to_vec();
+                    expected[192..256].copy_from_slice(&v5);
+                    v5[1] = 0x5a;
+                    expected[1] = 0x5a;
+                    assert_eq!(outcome.memory, expected);
+                    assert_eq!(outcome.vector_registers[4].0, expected[64..128]);
+                    assert_eq!(outcome.vector_registers[6].0, expected[192..256]);
+                    assert_eq!(outcome.vector_registers[8].0, v5[..]);
+                }
+                (Input::ReadOnly, 100) => {
+                    assert!(outcome.result.contains("AccessViolation(Store"));
+                    assert_eq!(outcome.pc, 5);
+                    assert_eq!(outcome.vector_registers[3].0, input[128..192]);
+                }
+                (Input::Gapped, 100) => {
+                    // Only even frames are mapped: the load at 128 maps the second frame
+                    assert!(
+                        outcome.result.contains("AccessViolation(Store"),
+                        "{}",
+                        outcome.result
+                    );
+                    assert_eq!(outcome.pc, 5);
+                    assert_eq!(outcome.vector_registers[3].0, input[64..128]);
+                }
+                (Input::Shifted, 100) => {
+                    // The first access is below the region, in the same region index
+                    assert!(outcome
+                        .result
+                        .contains("AccessViolation(Load, 17179869184, 64"));
+                    assert_eq!(outcome.pc, 2);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A region longer than the region size of the aligned mapping: accesses which start beyond its
+/// region index fault even though they are inside the region (the unaligned mapping has no such
+/// limit), so a run must not translate across the index boundary
+#[test]
+fn test_memory_run_region_index_boundary() {
+    let region_size = 1 << 20;
+    let input = input_pattern(region_size + 256);
+    let mut words = lddw(1, ebpf::MM_INPUT_START + region_size as u64 - 128).to_vec();
+    words.extend([ld(1, 0), ld(2, 64), ld(3, 128), mov64_imm(0, 9), exit()]);
+    for last in [127, 128] {
+        words[4] = ld(3, last);
+        for aligned in [false, true] {
+            let executable = verified(
+                &words,
+                Config {
+                    aligned_region_size: region_size,
+                    ..config(true, aligned)
+                },
+            );
+            let outcome = run_both(&executable, &input, Input::Writable, 100);
+            if aligned && last == 128 {
+                assert!(outcome
+                    .result
+                    .contains("AccessViolation(Load, 17180917760, 64"));
+                assert_eq!(
+                    outcome.vector_registers[2].0,
+                    input[region_size - 64..region_size]
+                );
+            } else {
+                assert_eq!(outcome.result, "Ok(9)");
+            }
+        }
+    }
+}
+
+/// The instruction meter running out at any instruction of a run, with and without instruction
+/// meter checkpoints inside the run
+#[test]
+fn test_memory_run_instruction_meter() {
+    let input = input_pattern(320);
+    let mut words = vec![mov64_reg(6, 1), vop(op::SPLAT_D, 0, 9, 0, 0)];
+    for i in 0..12i16 {
+        words.push(ld(i as u8 % 4, 16 * i));
+        words.push(vop(op::ADD_D, 0, 8, 8, i as u8 % 4));
+        words.push(st(8, 128 + 8 * i));
+        if i % 5 == 4 {
+            words.push(ldbc_q(9, 3 * i));
+        }
+    }
+    words.push(vop(op::HSUM_D, 0, 0, 8, 0));
+    words.push(exit());
+    // Straight-line code, one CU per instruction
+    let needed = words.len() as u64;
+    for checkpoint_distance in [1000, 0, 1, 2, 3, 7] {
+        for budget in 0..=needed {
+            let outcome = run_with_and_without_memory_runs(
+                &words,
+                &input,
+                Input::Writable,
+                budget,
+                checkpoint_distance,
+            );
+            if budget < needed {
+                assert_eq!(outcome.result, "Err(ExceededMaxInstructions)", "{budget}");
+            } else {
+                assert!(outcome.result.starts_with("Ok("), "{}", outcome.result);
+            }
+        }
+    }
+    if memory_runs_available() {
+        let executable = verified(&words, run_config(true, 1000));
+        executable.jit_compile().unwrap();
+        assert!((3..words.len() - 3).all(|pc| inside_memory_run(&executable, pc)));
+    }
+}
+
+/// Anything between two vector ops ends a run: r1 may have changed and host code may have run
+#[test]
+fn test_memory_run_boundaries() {
+    let input = input_pattern(512);
+    let mut words = vec![
+        mov64_reg(6, 1),
+        ld(1, 0),
+        ld(2, 64),
+        add64_imm(1, 64),
+        ld(3, 0),
+        ld(4, 64),
+        mov64_imm(1, 1),
+        syscall(SYSCALL_CLOBBER),
+        mov64_reg(1, 6),
+        st(3, 256),
+        st(4, 320),
+        // The callee moves r1 and stores through it
+        call_internal(0),
+    ];
+    let call = words.len() - 1;
+    words.extend([
+        ld(5, 0),
+        ld(6, 64),
+        vop(op::ADD_D, 0, 0, 5, 6),
+        vop(op::HSUM_D, 0, 0, 0, 0),
+        exit(),
+    ]);
+    let function = words.len();
+    words[call] = call_internal((function - call - 1) as i32);
+    words.extend([ld(7, 384), add64_imm(1, 128), st(7, 0), ld(8, 0), exit()]);
+    for kind in [Input::Writable, Input::CopyOnWrite] {
+        let outcome = run_with_and_without_memory_runs(&words, &input, kind, 1000, 1000);
+        assert!(outcome.result.starts_with("Ok("), "{}", outcome.result);
+        assert_eq!(outcome.vector_registers[3].0, input[64..128]);
+        assert_eq!(outcome.vector_registers[4].0, input[128..192]);
+        assert_eq!(outcome.vector_registers[5].0, input[384..448]);
+        assert_eq!(&outcome.memory[128..192], &input[384..448]);
+        assert_eq!(&outcome.memory[256..320], &input[64..128]);
+    }
+}
+
+/// Jumps and calls into a run: a jump target starts a new run, callx may enter anywhere
+#[test]
+fn test_memory_run_entered_in_the_middle() {
+    let input = input_pattern(256);
+    let text_vaddr = executable(&[exit()], config(true, true), SBPFVersion::V3)
+        .get_text_bytes()
+        .0;
+    let (head, target, last_exit) = (4, 8, 20);
+    let mut words = vec![
+        mov64_reg(6, 1),
+        mov64_imm(7, 3),
+        mov64_imm(8, 0),
+        vop(op::SPLAT_D, 0, 9, 0, 0),
+        // Three iterations, the loop head starts a run
+        ld(1, 0),
+        ld(2, 64),
+        vop(op::ADD_D, 0, 1, 1, 9),
+        st(1, 0),
+        ld(3, 128),
+        vop(op::ADD_D, 0, 3, 3, 2),
+        st(3, 128),
+        add64_imm(7, -1),
+        jump(ebpf::JNE64_IMM, 7, 0, head as i16 - 13),
+        // The callx below returns from here
+        jump(ebpf::JNE64_IMM, 8, 0, last_exit as i16 - 14),
+        mov64_imm(8, 1),
+        mov64_imm(7, 1),
+    ];
+    // callx into the middle of the run
+    words.extend(lddw(2, text_vaddr + 8 * target as u64));
+    words.extend([
+        insn(ebpf::CALL_REG, 2, 0, 0, 0),
+        vop(op::HSUM_D, 0, 0, 3, 0),
+        exit(),
+    ]);
+    assert_eq!(words.len(), last_exit + 1);
+    for budget in [1000, 30, 40, 41, 42, 43, 44, 45] {
+        let outcome =
+            run_with_and_without_memory_runs(&words, &input, Input::Writable, budget, 1000);
+        if budget == 1000 {
+            assert!(outcome.result.starts_with("Ok("), "{}", outcome.result);
+            // The callx adds v2 to v3 a fourth time
+            let lane = |bytes: &[u8], i: usize| {
+                u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+            };
+            for i in 0..16 {
+                assert_eq!(
+                    lane(&outcome.memory[128..192], i),
+                    lane(&input[128..192], i)
+                        .wrapping_add(lane(&input[64..128], i).wrapping_mul(4))
+                );
+            }
+        }
+    }
+    if memory_runs_available() {
+        let executable = verified(&words, run_config(true, 1000));
+        executable.jit_compile().unwrap();
+        assert!(!inside_memory_run(&executable, head));
+        assert!(inside_memory_run(&executable, head + 1) && inside_memory_run(&executable, target));
+    }
+}
+
+/// Random programs of runs: accesses near region boundaries, every kind of region, random budgets
+#[test]
+fn test_memory_runs_random() {
+    let mut rng = SmallRng::seed_from_u64(0x7275_6e73);
+    let input = input_pattern(320);
+    for _ in 0..400 {
+        let mut words = vec![mov64_reg(6, 1), vop(op::SPLAT_Q, 0, 29, 0, 0)];
+        for _ in 0..rng.gen_range(1..4) {
+            words.push(mov64_reg(1, 6));
+            let base = [0, 64, 256, 300, 320, -64, -8, 5000][rng.gen_range(0..8)];
+            words.push(add64_imm(1, base));
+            for _ in 0..rng.gen_range(1..10) {
+                let off = if rng.gen_bool(0.8) {
+                    rng.gen_range(-80..330)
+                } else {
+                    rng.gen()
+                };
+                let (out, in0) = (rng.gen_range(0..30), rng.gen_range(0..30));
+                words.push(match rng.gen_range(0..6) {
+                    0 | 1 => ld(out, off),
+                    2 => st(in0, off),
+                    3 => ldbc_d(out, off),
+                    4 => ldbc_q(out, off),
+                    _ => vop(op::ADD_Q, 0, out, in0, 29),
+                });
+            }
+        }
+        words.push(vop(op::HSUM_Q, 0, 0, 29, 0));
+        words.push(exit());
+        let kind = [
+            Input::Writable,
+            Input::ReadOnly,
+            Input::CopyOnWrite,
+            Input::Gapped,
+            Input::Shifted,
+        ][rng.gen_range(0..5)];
+        let budget = if rng.gen_bool(0.5) {
+            1000
+        } else {
+            rng.gen_range(0..words.len() as u64)
+        };
+        let checkpoint_distance = [1000, 1000, 2, 5][rng.gen_range(0..4)];
+        run_with_and_without_memory_runs(&words, &input, kind, budget, checkpoint_distance);
+    }
 }
 
 /// Comparison of the reference semantics (interpreter) against native AVX-512 intrinsics

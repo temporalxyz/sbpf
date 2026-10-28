@@ -297,6 +297,8 @@ pub struct JitCompiler<'a, C: ContextObject> {
     stopwatch_is_active: bool,
     /// Bit set of the vector registers used by the program, 0 if it has no vector ops
     vector_registers_used: u32,
+    /// See [vector_jit::MemoryRuns]
+    vector_memory_runs: vector_jit::MemoryRuns,
 }
 
 #[rustfmt::skip]
@@ -363,6 +365,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             diversification_rng,
             stopwatch_is_active: false,
             vector_registers_used,
+            vector_memory_runs: vector_jit::MemoryRuns::default(),
         })
     }
 

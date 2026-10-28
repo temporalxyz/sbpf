@@ -14,20 +14,26 @@
 //!   purpose registers if the memory mapping is aligned and the access is plain (in bounds,
 //!   not gapped, permitted). Everything else goes to [MemoryMapping::map_with_access_violation_handler]
 //!   which is exactly what the scalar path calls. So results, errors and CUs match.
+//! - A run of vector ops with several memory accesses translates the address range they cover
+//!   once, see [MemoryRuns].
 
 use super::*;
 use crate::{
     error::StableResult,
     memory_region::{jit_region_layout, AccessType, JitRegionTable},
-    vector::{op, VectorInsn, VECTOR_REGISTERS, VECTOR_SIZE},
-    x86_evex::{kmovq_to_gpr, EvexInstruction, Length, Map::*, Prefix::*, VZEROUPPER},
+    vector::{op, VectorInsn, VECTOR_OP_SRC, VECTOR_REGISTERS, VECTOR_SIZE},
+    x86_evex::{kmovq_to_gpr, EvexInstruction, Length, Map::*, Prefix::*, Rm, VZEROUPPER},
 };
+use std::convert::TryFrom;
 
 /// Machine code length of the vector subroutines (prologue and translation), upper bound
 pub(super) const MAX_VECTOR_SUBROUTINES_MACHINE_CODE_LENGTH: usize = 32 * 1024;
 
 /// Lengths of the memory accesses which have a translation subroutine
 const TRANSLATION_LENGTHS: [u64; 5] = [1, 2, 4, 8, VECTOR_SIZE as u64];
+
+/// Machine code length of the fallback and the entry of one instruction of a [MemoryRun], upper bound
+const MAX_MEMORY_RUN_TRAILER_LENGTH_PER_INSTRUCTION: usize = 80;
 
 /// Scratch vector registers
 const ZMM30: u8 = 30;
@@ -84,6 +90,51 @@ extern "C" fn translate_slow_path(
         StableResult::Ok(host_buffer) => ProgramResult::Ok(host_buffer.ptr().cast::<u8>() as u64),
         StableResult::Err(err) => ProgramResult::Err(err),
     };
+}
+
+/// Memory runs: consecutive vector ops (nothing else in between, so `r1` is unchanged and no host
+/// code runs) with two or more memory accesses, no jump target after the first access and no
+/// instruction meter checkpoint inside.
+///
+/// The first access calls a span translation subroutine for the range all accesses of the run
+/// cover. If the range lies in one plain region (the condition the translation fast path checks
+/// for every single access) REGISTER_SCRATCH holds its host address (minus a key) for the rest of
+/// the run and each access is `[REGISTER_SCRATCH + displacement]` after the usual instruction
+/// meter check. Otherwise REGISTER_SCRATCH is 0 and every access jumps to its fallback, which is
+/// exactly the code a single access emits (and leaves REGISTER_SCRATCH 0). So faults, the access
+/// violation handler and CUs behave as without runs. Entering a run anywhere but at its start
+/// (`callx` may target any instruction) goes through an entry which zeroes REGISTER_SCRATCH.
+#[derive(Default)]
+pub(super) struct MemoryRuns {
+    /// Text section offsets of the span translation subroutines for loads only and for runs with
+    /// stores, if the region layout allows inline translation
+    span_translation: Option<[usize; 2]>,
+    /// Whether a pc may be reached other than from the previous instruction, filled on first use
+    jump_targets: Vec<bool>,
+    /// The run being emitted
+    run: Option<MemoryRun>,
+}
+
+/// See [MemoryRuns]
+struct MemoryRun {
+    /// pc of the first memory access
+    start: usize,
+    /// pc of the last memory access
+    end: usize,
+    /// Smallest displacement of the accesses
+    min_off: i16,
+    /// The accesses emitted so far
+    fallbacks: Vec<MemoryRunFallback>,
+}
+
+/// An access of a [MemoryRun] whose fallback is emitted at the end of the run
+struct MemoryRunFallback {
+    pc: usize,
+    insn: VectorInsn,
+    /// Text section offset of the rel32 of the jump to the fallback
+    jump: usize,
+    /// Text section offset of the code after the access
+    resume: usize,
 }
 
 /// One host instruction of a lowering
@@ -335,21 +386,253 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             return;
         };
         let lowering = lower(&vector_insn);
-        if let Some((access_type, len)) = lowering.memory {
-            if vector_insn.off == 0 {
-                self.emit_ins(X86Instruction::mov(
-                    OperandSize::S64,
-                    REGISTER_MAP[1],
-                    REGISTER_SCRATCH,
-                ));
-            } else {
-                self.emit_vm_address(REGISTER_MAP[1], vector_insn.off as i64, true);
+        match lowering.memory {
+            Some((access_type, len)) => {
+                if self.vector_memory_runs.run.is_none() {
+                    self.emit_memory_run_start();
+                }
+                if self.vector_memory_runs.run.is_some() {
+                    self.emit_memory_run_access(vector_insn, &lowering);
+                } else {
+                    self.emit_r1_plus_off(vector_insn.off);
+                    self.emit_vector_translation_call(access_type, len, self.pc);
+                    for instruction in &lowering.instructions {
+                        self.emit_host_instruction(instruction);
+                    }
+                }
             }
-            self.emit_vector_translation_call(access_type, len);
+            None => {
+                for instruction in &lowering.instructions {
+                    self.emit_host_instruction(instruction);
+                }
+            }
         }
+        let pc = self.pc;
+        if let Some(run) = self.vector_memory_runs.run.take_if(|run| run.end == pc) {
+            self.emit_memory_run_end(run);
+        }
+    }
+
+    /// REGISTER_SCRATCH = r1 + off
+    fn emit_r1_plus_off(&mut self, off: i16) {
+        if off == 0 {
+            self.emit_ins(X86Instruction::mov(
+                OperandSize::S64,
+                REGISTER_MAP[1],
+                REGISTER_SCRATCH,
+            ));
+        } else {
+            self.emit_vm_address(REGISTER_MAP[1], off as i64, true);
+        }
+    }
+
+    /// Key which blinds the user provided displacements in [MemoryRuns]
+    fn memory_run_key(&self) -> i64 {
+        if self.config.sanitize_user_provided_values {
+            // Small enough that displacement + key fits in 32 bits
+            (self.immediate_value_key as i32 >> 1) as i64
+        } else {
+            0
+        }
+    }
+
+    /// Returns which pcs may be reached other than from the previous instruction
+    fn find_jump_targets(&self) -> Vec<bool> {
+        let instruction_count = self.program.len() / ebpf::INSN_SIZE;
+        let mut targets = vec![false; instruction_count];
+        let mut mark = |pc: i64| {
+            if let Some(target) = usize::try_from(pc).ok().and_then(|pc| targets.get_mut(pc)) {
+                *target = true;
+            }
+        };
+        mark(self.executable.get_entrypoint_instruction_offset() as i64);
+        for (_, (_, pc)) in self.executable.get_function_registry().iter() {
+            mark(pc as i64);
+        }
+        let mut pc = 0;
+        while pc < instruction_count {
+            let insn = ebpf::get_insn_unchecked(self.program, pc);
+            // Over-approximates: every other jump class instruction marks pc + off + 1, calls also
+            // pc + imm + 1
+            let class = insn.opc & ebpf::BPF_CLS_MASK;
+            let vector_op = insn.opc == ebpf::CALL_IMM && insn.src == VECTOR_OP_SRC;
+            if (class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32) && !vector_op {
+                mark(pc as i64 + insn.off as i64 + 1);
+                if insn.opc == ebpf::CALL_IMM {
+                    mark((pc as i64).saturating_add(insn.imm).saturating_add(1));
+                }
+            }
+            pc += if insn.opc == ebpf::LD_DW_IMM
+                && !self.executable.get_sbpf_version().disable_lddw()
+            {
+                2
+            } else {
+                1
+            };
+        }
+        targets
+    }
+
+    /// Starts a [MemoryRun] at the memory access at self.pc if there is one
+    fn emit_memory_run_start(&mut self) {
+        let Some(span_translation) = self.vector_memory_runs.span_translation else {
+            return;
+        };
+        // The tracer clobbers REGISTER_SCRATCH before every instruction
+        if cfg!(feature = "tracer") || !self.config.aligned_memory_mapping {
+            return;
+        }
+        if self.vector_memory_runs.jump_targets.is_empty() {
+            self.vector_memory_runs.jump_targets = self.find_jump_targets();
+        }
+        // An instruction meter checkpoint clobbers REGISTER_SCRATCH
+        let limit = if self.config.enable_instruction_meter {
+            self.last_instruction_meter_validation_pc
+                .saturating_add(self.config.instruction_meter_checkpoint_distance)
+        } else {
+            usize::MAX
+        };
+        let (mut end, mut accesses, mut stores) = (self.pc, 0, false);
+        let (mut min_off, mut max_end) = (i64::MAX, i64::MIN);
+        let mut pc = self.pc;
+        while (pc + 1) * ebpf::INSN_SIZE <= self.program.len()
+            && (pc == self.pc || (pc < limit && !self.vector_memory_runs.jump_targets[pc]))
+        {
+            let insn = ebpf::get_insn_unchecked(self.program, pc);
+            if insn.opc != ebpf::CALL_IMM || insn.src != VECTOR_OP_SRC {
+                break;
+            }
+            let Ok(vector_insn) = VectorInsn::decode(&insn) else {
+                break;
+            };
+            if let Some((access_type, len)) = lower(&vector_insn).memory {
+                end = pc;
+                accesses += 1;
+                stores |= access_type == AccessType::Store;
+                min_off = min_off.min(vector_insn.off as i64);
+                max_end = max_end.max(vector_insn.off as i64 + len as i64);
+            }
+            pc += 1;
+        }
+        let worst_case_length = (end - self.pc + 3)
+            * (MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION
+                + MAX_MEMORY_RUN_TRAILER_LENGTH_PER_INSTRUCTION);
+        if accesses < 2
+            || self.offset_in_text_section + worst_case_length >= self.result.text_section().len()
+        {
+            return;
+        }
+        // REGISTER_SCRATCH = host address of the span - key, or 0
+        let key = self.memory_run_key();
+        self.emit_r1_plus_off(min_off as i16);
+        self.emit_ins(X86Instruction::store_immediate(
+            OperandSize::S64,
+            RSP,
+            X86IndirectAccess::OffsetIndexShift(-16, RSP, 0),
+            max_end - min_off - 1 + key,
+        ));
+        self.emit_ins(X86Instruction::call_immediate(
+            self.relative_to_offset(span_translation[stores as usize], 5),
+        ));
+        self.vector_memory_runs.run = Some(MemoryRun {
+            start: self.pc,
+            end,
+            min_off: min_off as i16,
+            fallbacks: Vec::new(),
+        });
+    }
+
+    /// Emits a memory access of the current [MemoryRun]
+    fn emit_memory_run_access(&mut self, insn: VectorInsn, lowering: &Lowering) {
+        // Like the translation subroutines, never access memory beyond the instruction meter limit
+        if self.config.enable_instruction_meter {
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S64,
+                REGISTER_INSTRUCTION_METER,
+                self.pc as i64,
+                None,
+            ));
+            self.emit_ins(X86Instruction::conditional_jump_immediate(
+                0x86,
+                self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6),
+            ));
+        }
+        self.emit_ins(X86Instruction::test(
+            OperandSize::S64,
+            REGISTER_SCRATCH,
+            REGISTER_SCRATCH,
+            None,
+        ));
+        let jump = self.offset_in_text_section + 2;
+        self.emit_ins(X86Instruction::conditional_jump_immediate(0x84, 0)); // jz fallback
+        let run = self.vector_memory_runs.run.as_ref().unwrap();
+        let displacement = (insn.off as i64 - run.min_off as i64 + self.memory_run_key()) as i32;
         for instruction in &lowering.instructions {
-            self.emit_host_instruction(instruction);
+            let instruction = match instruction {
+                HostInstruction::Evex(evex) if matches!(evex.rm, Rm::Mem(..)) => {
+                    HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, displacement))
+                }
+                other => *other,
+            };
+            self.emit_host_instruction(&instruction);
         }
+        let resume = self.offset_in_text_section;
+        let run = self.vector_memory_runs.run.as_mut().unwrap();
+        run.fallbacks.push(MemoryRunFallback {
+            pc: self.pc,
+            insn,
+            jump,
+            resume,
+        });
+    }
+
+    /// Emits the fallbacks and entries of a [MemoryRun] after its last access
+    fn emit_memory_run_end(&mut self, run: MemoryRun) {
+        let skip = self.offset_in_text_section + 1;
+        self.emit_ins(X86Instruction::jump_immediate(0));
+        for fallback in run.fallbacks {
+            self.patch_rel32(fallback.jump);
+            let lowering = lower(&fallback.insn);
+            let (access_type, len) = lowering.memory.unwrap();
+            self.emit_r1_plus_off(fallback.insn.off);
+            self.emit_vector_translation_call(access_type, len, fallback.pc);
+            for instruction in &lowering.instructions {
+                self.emit_host_instruction(instruction);
+            }
+            // Keep using the fallbacks until the end of the run
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S32,
+                0x31,
+                REGISTER_SCRATCH,
+                REGISTER_SCRATCH,
+                None,
+            ));
+            self.emit_ins(X86Instruction::jump_immediate(
+                self.relative_to_offset(fallback.resume, 5),
+            ));
+        }
+        for pc in run.start + 1..=run.end {
+            let code = self.result.pc_section()[pc] as usize;
+            self.result.pc_section_mut()[pc] = self.offset_in_text_section as u32;
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S32,
+                0x31,
+                REGISTER_SCRATCH,
+                REGISTER_SCRATCH,
+                None,
+            ));
+            self.emit_ins(X86Instruction::jump_immediate(
+                self.relative_to_offset(code, 5),
+            ));
+        }
+        self.patch_rel32(skip);
+    }
+
+    /// Points the rel32 at `location` to the current offset
+    fn patch_rel32(&mut self, location: usize) {
+        let relative = self.offset_in_text_section as i32 - (location + 4) as i32;
+        self.result.text_section_mut()[location..location + 4]
+            .copy_from_slice(&relative.to_le_bytes());
     }
 
     /// Stores (`to_vm == true`) or loads the used vector registers to / from [EbpfVm::vector_registers]
@@ -395,13 +678,13 @@ impl<C: ContextObject> JitCompiler<'_, C> {
     /// Emits a call to the translation subroutine, the vm address must be in REGISTER_SCRATCH
     ///
     /// Afterwards REGISTER_SCRATCH contains the host address. All other registers are preserved.
-    fn emit_vector_translation_call(&mut self, access_type: AccessType, len: u64) {
-        // Store self.pc in the stack slot the slow path expects (see emit_address_translation)
+    fn emit_vector_translation_call(&mut self, access_type: AccessType, len: u64, pc: usize) {
+        // Store the pc in the stack slot the slow path expects (see emit_address_translation)
         self.emit_ins(X86Instruction::store_immediate(
             OperandSize::S64,
             RSP,
             X86IndirectAccess::OffsetIndexShift(-16, RSP, 0),
-            self.pc as i64,
+            pc as i64,
         ));
         self.emit_ins(X86Instruction::call_immediate(
             self.relative_to_anchor(translation_anchor(access_type, len), 5),
@@ -432,6 +715,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
                 AccessType::Store
             },
             len,
+            self.pc,
         );
         let size = match len {
             1 => OperandSize::S8,
@@ -497,7 +781,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         target_offset as i32 - (self.offset_in_text_section + instruction_length) as i32
     }
 
-    /// Emits the entry prologue and the translation subroutines
+    /// Emits the entry prologue and the translation subroutines (single accesses and spans)
     pub(super) fn emit_vector_subroutines(&mut self) {
         // Entry prologue: load the used vector registers, then jump to the entrypoint
         self.set_anchor(ANCHOR_VECTOR_PROLOGUE);
@@ -761,6 +1045,221 @@ impl<C: ContextObject> JitCompiler<'_, C> {
                 self.emit_ins(X86Instruction::return_near());
             }
         }
+
+        // Span translation subroutines, see MemoryRuns
+        // Input: first vm address of the span in REGISTER_SCRATCH, span length - 1 + key in X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)
+        // Output: host address of the span - key in REGISTER_SCRATCH, 0 if it is not in one plain region
+        let Some(layout) = layout else {
+            return;
+        };
+        let key = self.memory_run_key();
+        let mut span_translation = [0; 2];
+        for (access_type, offset) in [AccessType::Load, AccessType::Store]
+            .iter()
+            .zip(&mut span_translation)
+        {
+            let temporaries = [(RAX, -16), (RDX, -24)];
+            let restore_temporaries = |jit: &mut Self| {
+                for (reg, offset) in temporaries {
+                    jit.emit_ins(X86Instruction::load(
+                        OperandSize::S64,
+                        RSP,
+                        reg,
+                        X86IndirectAccess::OffsetIndexShift(offset, RSP, 0),
+                    ));
+                }
+            };
+            let span_length_minus_one = X86IndirectAccess::OffsetIndexShift(-8, RSP, 0);
+            // Not plain, emitted first so that the checks can branch backwards to it
+            let not_plain = self.offset_in_text_section;
+            restore_temporaries(self);
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S32,
+                0x31,
+                REGISTER_SCRATCH,
+                REGISTER_SCRATCH,
+                None,
+            ));
+            self.emit_ins(X86Instruction::return_near());
+            let not_plain_if = |jit: &mut Self, condition: u8| {
+                let offset = jit.relative_to_offset(not_plain, 6);
+                jit.emit_ins(X86Instruction::conditional_jump_immediate(
+                    condition, offset,
+                ));
+            };
+
+            *offset = self.offset_in_text_section;
+            for (reg, offset) in temporaries {
+                self.emit_ins(X86Instruction::store(
+                    OperandSize::S64,
+                    reg,
+                    RSP,
+                    X86IndirectAccess::OffsetIndexShift(offset, RSP, 0),
+                ));
+            }
+            // RAX = last vm address of the span, must not overflow and have the region index of the first
+            self.emit_ins(X86Instruction::load(
+                OperandSize::S64,
+                RSP,
+                RAX,
+                span_length_minus_one,
+            ));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                0,
+                RAX,
+                -key,
+                None,
+            ));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x01,
+                REGISTER_SCRATCH,
+                RAX,
+                None,
+            ));
+            not_plain_if(self, 0x82); // jc
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x31,
+                REGISTER_SCRATCH,
+                RAX,
+                None,
+            ));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0xc1,
+                5,
+                RAX,
+                virtual_address_bits,
+                None,
+            ));
+            not_plain_if(self, 0x85); // jne
+
+            // The checks of the translation fast path for the first vm address and len = span length
+            let table = std::mem::offset_of!(MemoryMapping, jit_region_table) as i32;
+            self.emit_ins(X86Instruction::load(
+                OperandSize::S64,
+                REGISTER_PTR_TO_VM,
+                RAX,
+                X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping)),
+            ));
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S64,
+                RAX,
+                virtual_address_bits,
+                Some(X86IndirectAccess::Offset(
+                    table + std::mem::offset_of!(JitRegionTable, virtual_address_bits) as i32,
+                )),
+            ));
+            not_plain_if(self, 0x85); // jne
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RDX));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0xc1,
+                5,
+                RDX,
+                virtual_address_bits,
+                None,
+            ));
+            self.emit_ins(X86Instruction::cmp(
+                OperandSize::S64,
+                RDX,
+                RAX,
+                Some(X86IndirectAccess::Offset(
+                    table + std::mem::offset_of!(JitRegionTable, len) as i32,
+                )),
+            ));
+            not_plain_if(self, 0x86); // jbe
+            self.emit_imul_rdx_immediate(layout.size as i32);
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x03,
+                RDX,
+                RAX,
+                Some(X86IndirectAccess::Offset(
+                    table + std::mem::offset_of!(JitRegionTable, regions) as i32,
+                )),
+            ));
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S8,
+                RDX,
+                63,
+                Some(X86IndirectAccess::Offset(layout.vm_gap_shift as i32)),
+            ));
+            not_plain_if(self, 0x85); // jne
+            if *access_type == AccessType::Store {
+                self.emit_ins(X86Instruction::cmp_immediate(
+                    OperandSize::S64,
+                    RDX,
+                    1,
+                    Some(X86IndirectAccess::Offset(layout.host_tag as i32)),
+                ));
+                not_plain_if(self, 0x85); // jne
+            }
+            // RAX = begin_offset, must not underflow
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RAX));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x2b,
+                RAX,
+                RDX,
+                Some(X86IndirectAccess::Offset(layout.vm_addr as i32)),
+            ));
+            not_plain_if(self, 0x82); // jb
+
+            // begin_offset + span length - 1 must be < host length (no overflow, checked above)
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x03,
+                RAX,
+                RSP,
+                Some(span_length_minus_one),
+            ));
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                0,
+                RAX,
+                -key,
+                None,
+            ));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x3b,
+                RAX,
+                RDX,
+                Some(X86IndirectAccess::Offset(layout.host_len as i32)),
+            ));
+            not_plain_if(self, 0x83); // jae
+
+            // REGISTER_SCRATCH = host_ptr + begin_offset - key
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RAX));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x2b,
+                RAX,
+                RDX,
+                Some(X86IndirectAccess::Offset(layout.vm_addr as i32)),
+            ));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x03,
+                RAX,
+                RDX,
+                Some(X86IndirectAccess::Offset(layout.host_ptr as i32)),
+            ));
+            self.emit_ins(X86Instruction::lea(
+                OperandSize::S64,
+                RAX,
+                REGISTER_SCRATCH,
+                Some(X86IndirectAccess::Offset(-key as i32)),
+            ));
+            restore_temporaries(self);
+            self.emit_ins(X86Instruction::return_near());
+        }
+        self.vector_memory_runs.span_translation = Some(span_translation);
     }
 
     /// `imul rdx, rdx, immediate`
