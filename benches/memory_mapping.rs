@@ -1,0 +1,413 @@
+// Copyright 2020 Solana Maintainers <maintainers@solana.com>
+//
+// Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
+// the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+extern crate rand;
+extern crate solana_sbpf;
+
+use criterion::{criterion_group, criterion_main, Criterion};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
+use solana_sbpf::{
+    memory_region::{AccessType, MemoryMapping, MemoryRegion},
+    program::SBPFVersion,
+    vm::Config,
+};
+use std::hint;
+
+fn generate_memory_regions(
+    entries: usize,
+    writable: bool,
+    mut prng: Option<&mut SmallRng>,
+) -> (Vec<MemoryRegion>, u64) {
+    let mut memory_regions = Vec::with_capacity(entries);
+    let mut offset = 0x100000000;
+    for _ in 0..entries {
+        let length = match &mut prng {
+            Some(prng) => (*prng).gen::<u8>() as u64 + 4,
+            None => 4,
+        };
+        let mut content = vec![0; length as usize];
+        if writable {
+            memory_regions.push(MemoryRegion::new(&raw mut content[..], offset));
+        } else {
+            memory_regions.push(MemoryRegion::new(&raw const content[..], offset));
+        }
+        offset += 0x100000000;
+    }
+    (memory_regions, offset)
+}
+
+macro_rules! new_prng {
+    ( ) => {
+        SmallRng::from_seed([0; 32])
+    };
+}
+
+fn bench_prng(c: &mut Criterion) {
+    let mut prng = new_prng!();
+    c.bench_function("bench_prng", |b| b.iter(|| prng.gen::<u64>()));
+}
+
+macro_rules! bench_gapped_randomized_access_with_1024_entries {
+    (do_bench, $name:ident, $aligned_memory_mapping:expr) => {
+        fn $name(c: &mut Criterion) {
+            let frame_size: u64 = 2;
+            let frame_count: u64 = 1024;
+            let content = vec![0; (frame_size * frame_count * 2) as usize];
+            let config = Config {
+                aligned_memory_mapping: $aligned_memory_mapping,
+                ..Config::default()
+            };
+            let memory_regions = vec![MemoryRegion::new_gapped(
+                &raw const content[..],
+                0x100000000,
+                frame_size,
+            )];
+            let memory_mapping =
+                unsafe { MemoryMapping::new(memory_regions, &config, SBPFVersion::V3) }.unwrap();
+            let mut prng = new_prng!();
+            c.bench_function(stringify!($name), |b| {
+                b.iter(|| {
+                    assert!(memory_mapping
+                        .map(
+                            AccessType::Load,
+                            0x100000000 + (prng.gen::<u64>() % frame_count * (frame_size * 2)),
+                            1,
+                        )
+                        .is_ok());
+                })
+            });
+        }
+    };
+    () => {
+        bench_gapped_randomized_access_with_1024_entries!(
+            do_bench,
+            bench_gapped_randomized_access_with_1024_entries_aligned,
+            true
+        );
+        bench_gapped_randomized_access_with_1024_entries!(
+            do_bench,
+            bench_gapped_randomized_access_with_1024_entries_unaligned,
+            false
+        );
+    };
+}
+bench_gapped_randomized_access_with_1024_entries!();
+
+macro_rules! bench_randomized_access_with_0001_entry {
+    (do_bench, $name:ident, $aligned_memory_mapping:expr) => {
+        fn $name(c: &mut Criterion) {
+            let content = vec![0; 1024 * 2];
+            let memory_regions = vec![MemoryRegion::new(&raw const content[..], 0x100000000)];
+            let config = Config {
+                aligned_memory_mapping: $aligned_memory_mapping,
+                ..Config::default()
+            };
+            let memory_mapping =
+                unsafe { MemoryMapping::new(memory_regions, &config, SBPFVersion::V3) }.unwrap();
+            let mut prng = new_prng!();
+            c.bench_function(stringify!($name), |b| {
+                b.iter(|| {
+                    let _ = memory_mapping.map(
+                        AccessType::Load,
+                        0x100000000 + (prng.gen::<u64>() % content.len() as u64),
+                        1,
+                    );
+                })
+            });
+        }
+    };
+    () => {
+        bench_randomized_access_with_0001_entry!(
+            do_bench,
+            bench_randomized_access_with_0001_entry_aligned,
+            true
+        );
+        bench_randomized_access_with_0001_entry!(
+            do_bench,
+            bench_randomized_access_with_0001_entry_unaligned,
+            false
+        );
+    };
+}
+bench_randomized_access_with_0001_entry!();
+
+macro_rules! bench_randomized_access_with_n_entries {
+    (do_bench, $name:ident, $aligned_memory_mapping:expr, $n:expr) => {
+        fn $name(c: &mut Criterion) {
+            let mut prng = new_prng!();
+            let (memory_regions, end_address) = generate_memory_regions($n, false, Some(&mut prng));
+            let config = Config {
+                aligned_memory_mapping: $aligned_memory_mapping,
+                ..Config::default()
+            };
+            let memory_mapping =
+                unsafe { MemoryMapping::new(memory_regions, &config, SBPFVersion::V3) }.unwrap();
+            c.bench_function(stringify!($name), |b| {
+                b.iter(|| {
+                    let _ = memory_mapping.map(
+                        AccessType::Load,
+                        0x100000000 + (prng.gen::<u64>() % end_address),
+                        1,
+                    );
+                })
+            });
+        }
+    };
+    ($n:expr, $aligned:ident, $unaligned:ident) => {
+        bench_randomized_access_with_n_entries!(do_bench, $aligned, true, $n);
+        bench_randomized_access_with_n_entries!(do_bench, $unaligned, false, $n);
+    };
+}
+bench_randomized_access_with_n_entries!(
+    4,
+    bench_randomized_access_with_0004_entries_aligned,
+    bench_randomized_access_with_0004_entries_unaligned
+);
+bench_randomized_access_with_n_entries!(
+    16,
+    bench_randomized_access_with_0016_entries_aligned,
+    bench_randomized_access_with_0016_entries_unaligned
+);
+bench_randomized_access_with_n_entries!(
+    64,
+    bench_randomized_access_with_0064_entries_aligned,
+    bench_randomized_access_with_0064_entries_unaligned
+);
+bench_randomized_access_with_n_entries!(
+    256,
+    bench_randomized_access_with_0256_entries_aligned,
+    bench_randomized_access_with_0256_entries_unaligned
+);
+bench_randomized_access_with_n_entries!(
+    1024,
+    bench_randomized_access_with_1024_entries_aligned,
+    bench_randomized_access_with_1024_entries_unaligned
+);
+
+macro_rules! bench_randomized_mapping_with_n_entries {
+    (do_bench, $name:ident, $aligned_memory_mapping:expr, $n:expr) => {
+        fn $name(c: &mut Criterion) {
+            let mut prng = new_prng!();
+            let (memory_regions, _end_address) =
+                generate_memory_regions($n, false, Some(&mut prng));
+            let config = Config::default();
+            let memory_mapping =
+                unsafe { MemoryMapping::new(memory_regions, &config, SBPFVersion::V3) }.unwrap();
+            c.bench_function(stringify!($name), |b| {
+                b.iter(|| {
+                    let _ = memory_mapping.map(AccessType::Load, 0x100000000, 1);
+                })
+            });
+        }
+    };
+    ($n:expr, $aligned:ident, $unaligned:ident) => {
+        bench_randomized_mapping_with_n_entries!(do_bench, $aligned, true, $n);
+        bench_randomized_mapping_with_n_entries!(do_bench, $unaligned, false, $n);
+    };
+}
+bench_randomized_mapping_with_n_entries!(
+    1,
+    bench_randomized_mapping_with_0001_entries_aligned,
+    bench_randomized_mapping_with_0001_entries_unaligned
+);
+bench_randomized_mapping_with_n_entries!(
+    4,
+    bench_randomized_mapping_with_0004_entries_aligned,
+    bench_randomized_mapping_with_0004_entries_unaligned
+);
+bench_randomized_mapping_with_n_entries!(
+    16,
+    bench_randomized_mapping_with_0016_entries_aligned,
+    bench_randomized_mapping_with_0016_entries_unaligned
+);
+bench_randomized_mapping_with_n_entries!(
+    64,
+    bench_randomized_mapping_with_0064_entries_aligned,
+    bench_randomized_mapping_with_0064_entries_unaligned
+);
+bench_randomized_mapping_with_n_entries!(
+    256,
+    bench_randomized_mapping_with_0256_entries_aligned,
+    bench_randomized_mapping_with_0256_entries_unaligned
+);
+bench_randomized_mapping_with_n_entries!(
+    1024,
+    bench_randomized_mapping_with_1024_entries_aligned,
+    bench_randomized_mapping_with_1024_entries_unaligned
+);
+
+macro_rules! bench_mapping_with_n_entries {
+    (do_bench, $name:ident, $aligned_memory_mapping:expr, $n:expr) => {
+        fn $name(c: &mut Criterion) {
+            let (memory_regions, _end_address) = generate_memory_regions($n, false, None);
+            let config = Config {
+                aligned_memory_mapping: $aligned_memory_mapping,
+                ..Config::default()
+            };
+            let memory_mapping =
+                unsafe { MemoryMapping::new(memory_regions, &config, SBPFVersion::V3) }.unwrap();
+            c.bench_function(stringify!($name), |b| {
+                b.iter(|| {
+                    let _ = memory_mapping.map(AccessType::Load, 0x100000000, 1);
+                })
+            });
+        }
+    };
+    ($n:expr, $aligned:ident, $unaligned:ident) => {
+        bench_mapping_with_n_entries!(do_bench, $aligned, true, $n);
+        bench_mapping_with_n_entries!(do_bench, $unaligned, false, $n);
+    };
+}
+bench_mapping_with_n_entries!(
+    1,
+    bench_mapping_with_001_entries_aligned,
+    bench_mapping_with_001_entries_unaligned
+);
+bench_mapping_with_n_entries!(
+    4,
+    bench_mapping_with_004_entries_aligned,
+    bench_mapping_with_004_entries_unaligned
+);
+bench_mapping_with_n_entries!(
+    16,
+    bench_mapping_with_0016_entries_aligned,
+    bench_mapping_with_0016_entries_unaligned
+);
+bench_mapping_with_n_entries!(
+    64,
+    bench_mapping_with_0064_entries_aligned,
+    bench_mapping_with_0064_entries_unaligned
+);
+bench_mapping_with_n_entries!(
+    256,
+    bench_mapping_with_0256_entries_aligned,
+    bench_mapping_with_0256_entries_unaligned
+);
+bench_mapping_with_n_entries!(
+    1024,
+    bench_mapping_with_1024_entries_aligned,
+    bench_mapping_with_1024_entries_unaligned
+);
+
+enum MemoryOperation {
+    Map,
+    Load,
+    Store(u64),
+}
+
+fn do_bench_mapping_operation(c: &mut Criterion, name: &str, op: MemoryOperation) {
+    let vm_addr = 0x100000000;
+    let mut mem1 = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+    let mut mem2 = [0x22; 1];
+    let config = Config {
+        aligned_memory_mapping: false,
+        ..Config::default()
+    };
+    let mut memory_mapping = unsafe {
+        MemoryMapping::new(
+            vec![
+                MemoryRegion::new(&raw mut mem1[..], vm_addr),
+                MemoryRegion::new(&raw mut mem2[..], vm_addr + 8),
+            ],
+            &config,
+            SBPFVersion::V3,
+        )
+    }
+    .unwrap();
+
+    match op {
+        MemoryOperation::Map => {
+            let f: fn(_, _, _, _) -> _ = hint::black_box(MemoryMapping::map);
+            c.bench_function(name, |b| {
+                b.iter(|| {
+                    f(
+                        &memory_mapping,
+                        AccessType::Load,
+                        hint::black_box(vm_addr),
+                        8,
+                    )
+                })
+            });
+        }
+        MemoryOperation::Load => {
+            let f: for<'a> fn(&'a mut _, _) -> _ = hint::black_box(MemoryMapping::load::<u64>);
+            c.bench_function(name, move |b| {
+                b.iter(|| f(&mut memory_mapping, hint::black_box(vm_addr)))
+            });
+        }
+        MemoryOperation::Store(val) => {
+            let f: for<'a> fn(&'a mut _, _, _) -> _ = hint::black_box(MemoryMapping::store);
+            c.bench_function(name, move |b| {
+                b.iter(|| {
+                    f(
+                        &mut memory_mapping,
+                        hint::black_box(val),
+                        hint::black_box(vm_addr),
+                    )
+                })
+            });
+        }
+    }
+}
+
+fn bench_mapping_8_byte_map(c: &mut Criterion) {
+    do_bench_mapping_operation(c, "bench_mapping_8_byte_map", MemoryOperation::Map)
+}
+
+fn bench_mapping_8_byte_load(c: &mut Criterion) {
+    do_bench_mapping_operation(c, "bench_mapping_8_byte_load", MemoryOperation::Load)
+}
+
+fn bench_mapping_8_byte_store(c: &mut Criterion) {
+    do_bench_mapping_operation(c, "bench_mapping_8_byte_store", MemoryOperation::Store(42))
+}
+
+criterion_group!(
+    benches,
+    bench_gapped_randomized_access_with_1024_entries_aligned,
+    bench_gapped_randomized_access_with_1024_entries_unaligned,
+    bench_randomized_access_with_0001_entry_aligned,
+    bench_randomized_access_with_0001_entry_unaligned,
+    bench_randomized_access_with_0004_entries_aligned,
+    bench_randomized_access_with_0004_entries_unaligned,
+    bench_randomized_access_with_0016_entries_aligned,
+    bench_randomized_access_with_0016_entries_unaligned,
+    bench_randomized_access_with_0064_entries_aligned,
+    bench_randomized_access_with_0064_entries_unaligned,
+    bench_randomized_access_with_0256_entries_aligned,
+    bench_randomized_access_with_0256_entries_unaligned,
+    bench_randomized_access_with_1024_entries_aligned,
+    bench_randomized_access_with_1024_entries_unaligned,
+    bench_randomized_mapping_with_0001_entries_aligned,
+    bench_randomized_mapping_with_0001_entries_unaligned,
+    bench_randomized_mapping_with_0004_entries_aligned,
+    bench_randomized_mapping_with_0004_entries_unaligned,
+    bench_randomized_mapping_with_0016_entries_aligned,
+    bench_randomized_mapping_with_0016_entries_unaligned,
+    bench_randomized_mapping_with_0064_entries_aligned,
+    bench_randomized_mapping_with_0064_entries_unaligned,
+    bench_randomized_mapping_with_0256_entries_aligned,
+    bench_randomized_mapping_with_0256_entries_unaligned,
+    bench_randomized_mapping_with_1024_entries_aligned,
+    bench_randomized_mapping_with_1024_entries_unaligned,
+    bench_mapping_with_001_entries_aligned,
+    bench_mapping_with_001_entries_unaligned,
+    bench_mapping_with_004_entries_aligned,
+    bench_mapping_with_004_entries_unaligned,
+    bench_mapping_with_0016_entries_aligned,
+    bench_mapping_with_0016_entries_unaligned,
+    bench_mapping_with_0064_entries_aligned,
+    bench_mapping_with_0064_entries_unaligned,
+    bench_mapping_with_0256_entries_aligned,
+    bench_mapping_with_0256_entries_unaligned,
+    bench_mapping_with_1024_entries_aligned,
+    bench_mapping_with_1024_entries_unaligned,
+    bench_prng,
+    bench_mapping_8_byte_map,
+    bench_mapping_8_byte_load,
+    bench_mapping_8_byte_store,
+);
+criterion_main!(benches);

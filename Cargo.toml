@@ -1,0 +1,77 @@
+[package]
+name = "solana-sbpf"
+version = "0.26.0"
+description = "Virtual machine and JIT compiler for eBPF programs"
+authors = ["Anza Maintainers <maintainers@anza.xyz>"]
+repository = "https://github.com/anza-xyz/sbpf"
+homepage = "https://solana.com/"
+keywords = ["BPF", "eBPF", "interpreter", "JIT", "filtering"]
+license = "Apache-2.0"
+edition = "2018"
+
+include = [
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "benches/**",
+    "LICENSE*",
+    "Cargo.toml",
+]
+
+[lib]
+bench = false
+
+[dependencies]
+arbitrary = { version = "1.0", optional = true, features = ["derive"] }
+byteorder = "1.2"
+combine = "3.8.1"
+gdbstub = { version = "0.6.2", optional = true }
+hash32 = "0.3.1"
+log = "0.4.2"
+rand = { version = "0.8.5", features = ["small_rng"] }
+rustc-demangle = "0.1"
+shuttle = { version = "0.9.3", optional = true }
+thiserror = "2.0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = { version = "0.2" }
+
+[features]
+default = ["jit"]
+jit = []
+jit-enable-host-stack-frames = ["jit"]
+fuzzer-not-safe-for-production = ["arbitrary"]
+tracer = []
+debugger = ["dep:gdbstub"]
+shuttle-test = ["dep:shuttle"]
+conf-stack-frame-size = []
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+elf = "0.0.10"
+json = "0.12"
+rand = { version = "0.8.5", features = ["small_rng"] }
+test_utils = { path = "test_utils/" }
+
+[[bench]]
+name = "elf_loader"
+harness = false
+
+[[bench]]
+name = "jit_compile"
+harness = false
+
+[[bench]]
+name = "function_registry"
+harness = false
+
+[[bench]]
+name = "memory_mapping"
+harness = false
+
+[[bench]]
+name = "vm_execution"
+harness = false

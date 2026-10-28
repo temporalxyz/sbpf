@@ -1,0 +1,65 @@
+#![no_main]
+
+use std::hint::black_box;
+
+use libfuzzer_sys::fuzz_target;
+
+use solana_sbpf::{
+    ebpf,
+    elf::Executable,
+    memory_region::MemoryRegion,
+    program::{BuiltinProgram, FunctionRegistry},
+    verifier::{RequisiteVerifier, Verifier},
+    vm::{CallFrame, ExecutionMode},
+};
+use test_utils::{create_vm, TestContextObject};
+
+use crate::common::ConfigTemplate;
+
+mod common;
+
+#[derive(arbitrary::Arbitrary, Debug)]
+struct DumbFuzzData {
+    template: ConfigTemplate,
+    prog: Vec<u8>,
+    mem: Vec<u8>,
+}
+
+fuzz_target!(|data: DumbFuzzData| {
+    let prog = data.prog;
+    let sbpf_version = data.template.sbpf_version;
+    let config = data.template.into();
+    let function_registry = FunctionRegistry::default();
+
+    if RequisiteVerifier::verify(&prog, sbpf_version, &function_registry).is_err() {
+        // verify please
+        return;
+    }
+    let mut mem = data.mem;
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        &prog,
+        std::sync::Arc::new(BuiltinProgram::new_loader(config)),
+        sbpf_version,
+        function_registry,
+    )
+    .unwrap();
+    let mem_region = MemoryRegion::new(&raw mut mem[..], ebpf::MM_INPUT_START);
+    let mut context_object = TestContextObject::new(1 << 4);
+    create_vm!(
+        interp_vm,
+        &executable,
+        &mut context_object,
+        stack,
+        heap,
+        vec![mem_region],
+        None
+    );
+
+    let mut interp_call_frames = vec![CallFrame::default(); executable.get_config().max_call_depth];
+    let (_interp_ins_count, interp_res) = interp_vm.execute_program(
+        &executable,
+        &mut ExecutionMode::Interpreted,
+        &mut interp_call_frames,
+    );
+    drop(black_box(interp_res));
+});

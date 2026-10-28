@@ -1,0 +1,52 @@
+name: Dispatch continuous fuzzing
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    environment: fuzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup update nightly
+      - run: rustup default nightly
+
+      - uses: dtolnay/install@d0dc46e85ffd2c174b5ac0489e17f95dae84fa5a # cargo-fuzz
+      - run: cargo +nightly fuzz build --no-trace-compares
+
+      - name: Prepare bundle
+        run: ./fuzz/build-fuzz-bundle.sh
+
+      - name: Collect elf-parser seed corpus
+        run: |
+          mkdir -p /tmp/elf-parser-corpus
+          cp ./tests/elfs/*.so /tmp/elf-parser-corpus/
+
+      - name: Upload elf-parser corpus to FuzzCorp
+        uses: asymmetric-research/fuzz-upload-action@d81375ddc1887ddf574713845dcfada9d3968edc # v2.1.0
+        with:
+          upload_type: corpus
+          upload_path: /tmp/elf-parser-corpus
+          upload_args: --lineage elf-parser --kind seed
+        env:
+          FUZZ_ORGANIZATION: anza
+          FUZZ_PROJECT: sbpf
+          FUZZ_API_KEY: ${{ secrets.FUZZ_API_KEY }}
+
+      - name: Upload bundle to FuzzCorp
+        uses: asymmetric-research/fuzz-upload-action@d81375ddc1887ddf574713845dcfada9d3968edc # v2.1.0
+        with:
+          upload_type: bundle
+          upload_path: ./fuzz/target/bundle
+        env:
+          FUZZ_ORGANIZATION: anza
+          FUZZ_PROJECT: sbpf
+          FUZZ_API_KEY: ${{ secrets.FUZZ_API_KEY }}
