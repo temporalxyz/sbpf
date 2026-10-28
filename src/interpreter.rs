@@ -561,6 +561,11 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
                 check_pc!(self, next_pc, target_pc.wrapping_sub(self.program_vm_addr) / ebpf::INSN_SIZE as u64);
             },
 
+            ebpf::CALL_IMM if insn.src == crate::vector::VECTOR_OP_SRC && config.enable_vector_ops && self.executable.get_sbpf_version().static_syscalls() => {
+                if let Err(err) = crate::vector::execute(self.vm, &mut self.reg, &insn) {
+                    throw_error!(self, err);
+                }
+            }
             ebpf::CALL_IMM => {
                 let mut resolved = false;
                 // External syscall

@@ -413,6 +413,9 @@ impl<C: ContextObject> Executable<C> {
             self.get_sbpf_version(),
             self.get_loader().get_function_registry(),
         )?;
+        if self.get_config().enable_vector_ops && self.get_sbpf_version().static_syscalls() {
+            crate::vector::verify(self.get_text_bytes().1, self.get_sbpf_version())?;
+        }
         Ok(())
     }
 

@@ -20,6 +20,7 @@ use crate::{
     memory_region::MemoryMapping,
     program::{BuiltinFunction, BuiltinProgram, FunctionRegistry, SBPFVersion},
     static_analysis::{Analysis, DummyContextObject, RegisterTraceEntry},
+    vector::{VectorRegister, VectorRegisterFile, VECTOR_REGISTERS},
 };
 // Re-export defaults for direct access without the module path.
 pub use defaults::get_stack_frame_size;
@@ -138,6 +139,9 @@ pub struct Config {
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
     /// Size of a region when using AlignedMemoryMapping
     pub aligned_region_size: usize,
+    /// Enables the 512-bit vector ops (`CALL_IMM` with `src = 2`) for SBPF versions with
+    /// static syscalls, see [crate::vector]
+    pub enable_vector_ops: bool,
 }
 
 impl Config {
@@ -165,6 +169,7 @@ impl Default for Config {
             aligned_memory_mapping: false,
             enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
             aligned_region_size: ebpf::MM_REGION_SIZE as usize,
+            enable_vector_ops: false,
         }
     }
 }
@@ -268,6 +273,8 @@ pub enum RuntimeEnvironmentSlot {
     MemoryMapping = offset_of!(EbpfVm<DummyContextObject>, memory_mapping) as isize,
     /// [EbpfVm::register_trace]
     RegisterTrace = offset_of!(EbpfVm<DummyContextObject>, register_trace) as isize,
+    /// [EbpfVm::vector_registers]
+    VectorRegisters = offset_of!(EbpfVm<DummyContextObject>, vector_registers) as isize,
 }
 
 /// A virtual machine to run eBPF programs.
@@ -356,6 +363,11 @@ pub struct EbpfVm<'a, C: ContextObject> {
     pub loader: Arc<BuiltinProgram<C>>,
     /// Collector for the instruction trace
     pub register_trace: Vec<RegisterTraceEntry>,
+    /// Vector registers (only used if [Config::enable_vector_ops])
+    ///
+    /// The JIT keeps them in host registers and only spills them here around host calls and when
+    /// leaving the program.
+    pub vector_registers: VectorRegisterFile,
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
@@ -402,6 +414,7 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             #[cfg(feature = "debugger")]
             debug_metadata: None,
             register_trace: Vec::default(),
+            vector_registers: [VectorRegister::ZERO; VECTOR_REGISTERS],
         }
     }
 
@@ -428,6 +441,9 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.previous_instruction_meter = initial_insn_count;
         self.due_insn_count = 0;
         self.program_result = ProgramResult::Ok(0);
+        if config.enable_vector_ops {
+            self.vector_registers = [VectorRegister::ZERO; VECTOR_REGISTERS];
+        }
 
         'execute: {
             match *mode {
@@ -634,5 +650,6 @@ mod tests {
         check_slot!(env, program_result, ProgramResult);
         check_slot!(env, memory_mapping, MemoryMapping);
         check_slot!(env, register_trace, RegisterTrace);
+        check_slot!(env, vector_registers, VectorRegisters);
     }
 }

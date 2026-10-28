@@ -128,12 +128,15 @@ unsafe impl<T: VmExposableMut, const N: usize> HostMemoryObject for *mut [T; N] 
 }
 
 /// Either mutable or immutable slice, returned by [`MemoryRegion::host_buffer`].
+// Note: `#[repr(C, u64)]` gives this enum a stable layout, which the inline address translation
+// of the JIT reads (see `jit_region_layout()`).
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
+#[repr(C, u64)]
 pub enum HostBuffer {
     /// The `MemoryRegion` is read-only.
-    Immutable(*const [u8]),
+    Immutable(*const [u8]) = 0,
     /// The `MemoryRegion` is writable (`AccessType::Store` is permitted.)
-    Mutable(*mut [u8]),
+    Mutable(*mut [u8]) = 1,
 }
 
 impl HostBuffer {
@@ -695,6 +698,72 @@ impl AlignedMemoryMapping {
     }
 }
 
+/// Snapshot of the region table of an [AlignedMemoryMapping], read by the inline address
+/// translation of the JIT for programs using vector ops.
+///
+/// `len == 0` makes the JIT always take the slow path (through [MemoryMapping::map_with_access_violation_handler]).
+/// It is refreshed whenever the regions vector may have been reallocated.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct JitRegionTable {
+    /// Pointer to the first [MemoryRegion]
+    pub(crate) regions: *const MemoryRegion,
+    /// Number of regions
+    pub(crate) len: u64,
+    /// The region index is `vm_addr >> virtual_address_bits`
+    pub(crate) virtual_address_bits: u64,
+}
+
+impl JitRegionTable {
+    const EMPTY: Self = Self {
+        regions: ptr::null(),
+        len: 0,
+        virtual_address_bits: 0,
+    };
+}
+
+/// Byte offsets of the [MemoryRegion] fields read by the inline address translation of the JIT
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JitRegionLayout {
+    /// `size_of::<MemoryRegion>()`
+    pub(crate) size: usize,
+    /// [MemoryRegion::vm_addr] (u64)
+    pub(crate) vm_addr: usize,
+    /// [MemoryRegion::vm_gap_shift] (u8)
+    pub(crate) vm_gap_shift: usize,
+    /// Discriminant of [MemoryRegion::host] (u64, 1 = [HostBuffer::Mutable])
+    pub(crate) host_tag: usize,
+    /// Host address of [MemoryRegion::host] (u64)
+    pub(crate) host_ptr: usize,
+    /// Length of [MemoryRegion::host] (u64)
+    pub(crate) host_len: usize,
+}
+
+/// Returns the layout of [MemoryRegion] for the JIT, `None` if it is not the expected one
+pub(crate) fn jit_region_layout() -> Option<JitRegionLayout> {
+    // The layout of `*mut [u8]` is not guaranteed, so probe which word is the address.
+    let probe = HostBuffer::Mutable(ptr::slice_from_raw_parts_mut(
+        ptr::without_provenance_mut::<u8>(0x1234_5678),
+        0x9abc,
+    ));
+    // SAFETY: `#[repr(C, u64)]` makes `HostBuffer` three initialized words without padding.
+    let words = unsafe { mem::transmute::<HostBuffer, [u64; 3]>(probe) };
+    let (host_ptr, host_len) = match words {
+        [1, 0x1234_5678, 0x9abc] => (8, 16),
+        [1, 0x9abc, 0x1234_5678] => (16, 8),
+        _ => return None,
+    };
+    let host = mem::offset_of!(MemoryRegion, host);
+    Some(JitRegionLayout {
+        size: mem::size_of::<MemoryRegion>(),
+        vm_addr: mem::offset_of!(MemoryRegion, vm_addr),
+        vm_gap_shift: mem::offset_of!(MemoryRegion, vm_gap_shift),
+        host_tag: host,
+        host_ptr: host.saturating_add(host_ptr),
+        host_len: host.saturating_add(host_len),
+    })
+}
+
 /// Common parts of [UnalignedMemoryMapping] and [AlignedMemoryMapping]
 pub struct MemoryMapping {
     /// Access violation handler
@@ -705,6 +774,8 @@ pub struct MemoryMapping {
     sbpf_version: SBPFVersion,
     initialized: bool,
     ty: MemoryMappingType,
+    /// See [JitRegionTable]
+    pub(crate) jit_region_table: JitRegionTable,
 }
 
 impl fmt::Debug for MemoryMapping {
@@ -788,6 +859,7 @@ impl MemoryMapping {
             sbpf_version,
             initialized: false,
             ty,
+            jit_region_table: JitRegionTable::EMPTY,
         }
     }
 
@@ -973,6 +1045,7 @@ impl MemoryMapping {
     /// again with [`Self::initialize`] before further use.
     pub fn get_regions_mut(&mut self) -> &mut [MemoryRegion] {
         self.initialized = false;
+        self.jit_region_table = JitRegionTable::EMPTY;
 
         let regions = match &mut self.ty {
             MemoryMappingType::Aligned(inner) => inner.regions.as_mut_slice(),
@@ -1017,6 +1090,14 @@ impl MemoryMapping {
             MemoryMappingType::Unaligned(inner) => inner.initialize(),
         };
         self.initialized = result.is_ok();
+        self.jit_region_table = match &self.ty {
+            MemoryMappingType::Aligned(inner) if self.initialized => JitRegionTable {
+                regions: inner.regions.as_ptr(),
+                len: inner.regions.len() as u64,
+                virtual_address_bits: inner.virtual_address_bits as u64,
+            },
+            _ => JitRegionTable::EMPTY,
+        };
         result
     }
 
@@ -1126,6 +1207,64 @@ mod test {
     use test_utils::assert_error;
 
     use super::*;
+
+    #[test]
+    fn test_jit_region_layout() {
+        let layout = jit_region_layout().unwrap();
+        let mut memory = [0u8; 16];
+        let region = MemoryRegion::new(&raw mut memory, 0x4_0000_0010);
+        let base = (&raw const region).cast::<u8>();
+        let read_u64 = |offset: usize| unsafe { base.add(offset).cast::<u64>().read_unaligned() };
+        assert_eq!(layout.size, mem::size_of::<MemoryRegion>());
+        assert_eq!(read_u64(layout.vm_addr), 0x4_0000_0010);
+        assert_eq!(unsafe { *base.add(layout.vm_gap_shift) }, 63);
+        assert_eq!(read_u64(layout.host_tag), 1);
+        assert_eq!(read_u64(layout.host_ptr), memory.as_ptr() as u64);
+        assert_eq!(read_u64(layout.host_len), 16);
+        let region = MemoryRegion::new(&raw const memory, 0);
+        let base = (&raw const region).cast::<u8>();
+        assert_eq!(
+            unsafe { base.add(layout.host_tag).cast::<u64>().read_unaligned() },
+            0
+        );
+    }
+
+    #[test]
+    fn test_jit_region_table() {
+        let config = Config {
+            aligned_memory_mapping: true,
+            ..Config::default()
+        };
+        let mut memory = [0u8; 16];
+        let mut mapping = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(&raw mut memory, ebpf::MM_INPUT_START)],
+                &config,
+                SBPFVersion::V3,
+            )
+        }
+        .unwrap();
+        // The input region is at index 4, the gaps before it are filled with empty regions
+        assert_eq!(mapping.jit_region_table.len, 5);
+        assert_eq!(mapping.jit_region_table.virtual_address_bits, 32);
+        assert_eq!(
+            mapping.jit_region_table.regions,
+            mapping.get_regions().as_ptr()
+        );
+        mapping.get_regions_mut();
+        assert_eq!(mapping.jit_region_table.len, 0);
+        mapping.initialize().unwrap();
+        assert_eq!(mapping.jit_region_table.len, 5);
+        let mapping = unsafe {
+            MemoryMapping::new(
+                vec![MemoryRegion::new(&raw mut memory, ebpf::MM_INPUT_START)],
+                &Config::default(),
+                SBPFVersion::V3,
+            )
+        }
+        .unwrap();
+        assert_eq!(mapping.jit_region_table.len, 0);
+    }
 
     #[test]
     fn test_mapping_cache() {

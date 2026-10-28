@@ -297,6 +297,8 @@ pub struct UnsealedJitProgram {
     pc_section: Mapping,
     /// The machine code.
     text_section: Mapping,
+    /// See [`JitProgram::entry_prologue`].
+    entry_prologue: Option<usize>,
 }
 
 impl UnsealedJitProgram {
@@ -316,6 +318,7 @@ impl UnsealedJitProgram {
         let mut program = Self {
             pc_section,
             text_section,
+            entry_prologue: None,
         };
         // The pc section relies on zero-initialization to distinguish unfilled forward-jump
         // targets from filled backward-jump targets in the old JIT. The pool may hand back
@@ -361,12 +364,18 @@ impl UnsealedJitProgram {
         &mut self.text_section
     }
 
+    /// Sets the offset in `text_section` where execution starts, see [`JitProgram::entry_prologue`].
+    pub fn set_entry_prologue(&mut self, offset: usize) {
+        self.entry_prologue = Some(offset);
+    }
+
     /// Make the pc section read-only and the text section, shrunk to the `used` length,
     /// executable.
     pub fn seal(self, used: usize) -> Result<JitProgram, EbpfError> {
         let Self {
             pc_section,
             mut text_section,
+            entry_prologue,
         } = self;
         if used > text_section.len() {
             return Err(EbpfError::ExhaustedTextSegment(used));
@@ -378,6 +387,7 @@ impl UnsealedJitProgram {
         Ok(JitProgram {
             pc_section: pc_section.protect()?,
             text_section: text_section.protect()?,
+            entry_prologue,
         })
     }
 }
@@ -390,6 +400,9 @@ pub struct JitProgram {
     pc_section: Mapping<Read>,
     /// The executable machine code.
     text_section: Mapping<ReadExecute>,
+    /// Offset in `text_section` of code which runs before jumping to the entrypoint (used by
+    /// programs with vector ops to load the vector registers).
+    entry_prologue: Option<usize>,
 }
 
 impl JitProgram {
@@ -409,6 +422,12 @@ impl JitProgram {
     #[inline]
     pub fn text_section(&self) -> &[u8] {
         &self.text_section
+    }
+
+    /// Offset in `text_section` where execution starts instead of the entrypoint, if any
+    #[inline]
+    pub fn entry_prologue(&self) -> Option<usize> {
+        self.entry_prologue
     }
 
     /// The length of the host machinecode in bytes

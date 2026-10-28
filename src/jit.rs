@@ -48,6 +48,9 @@ pub const MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT: usize = 24;
 /// The maximum machine code length of the randomized padding
 pub const MAX_START_PADDING_LENGTH: usize = 256;
 
+#[path = "vector_jit.rs"]
+mod vector_jit;
+
 impl<C: ContextObject> Executable<C> {
     /// JIT compile the executable
     ///
@@ -82,9 +85,9 @@ impl JitProgram {
         unsafe {
             let instruction_meter =
                 (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64);
-            let entrypoint = &self.text_section()
-                [self.pc_section()[registers[11] as usize] as usize & (i32::MAX as u32 as usize)]
-                as *const u8;
+            let entrypoint = &self.text_section()[self.entry_prologue().unwrap_or(
+                self.pc_section()[registers[11] as usize] as usize & (i32::MAX as u32 as usize),
+            )] as *const u8;
             let host_stack_pointer = &raw mut vm.host_stack_pointer;
             let vm = vm.encrypted_host_address();
             macro_rules! stmt_expr_attribute_asm {
@@ -128,6 +131,8 @@ impl JitProgram {
                 lateout("rsi") _, lateout("rdx") _, lateout("rcx") _, lateout("r8") _,
                 lateout("r9") _, lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
                 // lateout("rbp") _, lateout("rbx") _,
+                // The program calls host functions and may use vector registers
+                clobber_abi("C"),
             );
         }
     }
@@ -152,7 +157,9 @@ const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 12;
 const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
 const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
-const ANCHOR_COUNT: usize = 33; // Update me when adding or removing anchors
+const ANCHOR_VECTOR_PROLOGUE: usize = 33;
+const ANCHOR_VECTOR_TRANSLATE: usize = 34;
+const ANCHOR_COUNT: usize = 44; // Update me when adding or removing anchors
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -288,6 +295,8 @@ pub struct JitCompiler<'a, C: ContextObject> {
     immediate_value_key: i64,
     diversification_rng: SmallRng,
     stopwatch_is_active: bool,
+    /// Bit set of the vector registers used by the program, 0 if it has no vector ops
+    vector_registers_used: u32,
 }
 
 #[rustfmt::skip]
@@ -318,6 +327,17 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if let Some(q) = pc.checked_div(config.instruction_meter_checkpoint_distance) {
             code_length_estimate += q * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
+        let vector_registers_used = if config.enable_vector_ops {
+            crate::vector::registers_used_by_program(program, executable.get_sbpf_version())
+        } else {
+            0
+        };
+        if vector_registers_used != 0 {
+            if let Some(feature) = vector_jit::missing_host_feature() {
+                return Err(EbpfError::UnsupportedHostFeatures(feature));
+            }
+            code_length_estimate += vector_jit::MAX_VECTOR_SUBROUTINES_MACHINE_CODE_LENGTH;
+        }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));
 
@@ -342,6 +362,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             immediate_value_key,
             diversification_rng,
             stopwatch_is_active: false,
+            vector_registers_used,
         })
     }
 
@@ -381,6 +402,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             let target_pc = (self.pc as isize + insn.off as isize + 1) as usize;
 
             match insn.opc {
+                ebpf::CALL_IMM if self.vector_registers_used != 0 && insn.src == crate::vector::VECTOR_OP_SRC => self.emit_vector_op(&insn),
                 ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
                     self.emit_validate_and_profile_instruction_count(self.pc + 2);
                     self.pc += 1;
@@ -812,6 +834,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
 
         self.resolve_jumps();
+        if self.vector_registers_used != 0 {
+            self.result.set_entry_prologue(self.anchors[ANCHOR_VECTOR_PROLOGUE] as usize - self.result.text_section().as_ptr() as usize);
+        }
         self.result.seal(self.offset_in_text_section)
     }
 
@@ -866,6 +891,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     #[inline(always)]
     pub fn emit_ins(&mut self, instruction: X86Instruction) {
         instruction.emit(self);
+        self.emit_random_noop();
+    }
+
+    /// Emits a no-op at random intervals (diversification)
+    #[inline(always)]
+    fn emit_random_noop(&mut self) {
         if self.next_noop_insertion == 0 {
             self.next_noop_insertion = self.noop_range.sample(&mut self.diversification_rng);
             // X86Instruction::noop().emit(self)?;
@@ -969,6 +1000,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Calls an external Rust function
     pub fn emit_rust_call(&mut self, target: Value, arguments: &[Argument], result_reg: Option<X86Register>) {
+        // Host code may clobber all vector registers
+        if self.vector_registers_used != 0 {
+            self.emit_vector_registers_spill(true);
+        }
         let mut saved_registers = CALLER_SAVED_REGISTERS.to_vec();
         if let Some(reg) = result_reg {
             if let Some(dst) = saved_registers.iter().position(|x| *x == reg) {
@@ -1078,6 +1113,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for reg in saved_registers.iter().rev() {
             self.emit_ins(X86Instruction::pop(*reg));
         }
+
+        if self.vector_registers_used != 0 {
+            self.emit_vector_registers_spill(false);
+        }
     }
 
     /// Calls an internal function within the same program
@@ -1134,6 +1173,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// Helper for load and store instructions
     pub fn emit_address_translation(&mut self, dst: Option<X86Register>, vm_addr: Value, len: u64, value: Option<Value>) {
         debug_assert_ne!(dst.is_some(), value.is_some());
+        if self.vector_registers_used != 0 {
+            return self.emit_vector_address_translation(dst, vm_addr, len, value);
+        }
         let value_stack_slot = X86IndirectAccess::OffsetIndexShift(-96, RSP, 0);
 
         match value {
@@ -1388,6 +1430,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchNumerator), false) },
             ], None);
         }
+        // Leave the vector registers in EbpfVm::vector_registers
+        if self.vector_registers_used != 0 {
+            self.emit_vector_registers_spill(true);
+        }
         // Restore stack pointer in case we did not exit gracefully
         self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RSP, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::HostStackPointer))));
         self.emit_ins(X86Instruction::return_near());
@@ -1560,6 +1606,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Restore the clobbered REGISTER_MAP[0]
         self.emit_ins(X86Instruction::pop(REGISTER_MAP[0]));
         self.emit_ins(X86Instruction::jump_reg(RSP, Some(X86IndirectAccess::OffsetIndexShift(-24, RSP, 0)))); // Tail call to host_target_address
+
+        // Programs using vector ops translate addresses with emit_vector_subroutines() instead
+        if self.vector_registers_used != 0 {
+            self.emit_vector_subroutines();
+            return;
+        }
 
         // Translates a vm memory address to a host memory address
         let lower_key = self.immediate_value_key as i32 as i64;

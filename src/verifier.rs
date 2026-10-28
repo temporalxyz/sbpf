@@ -78,6 +78,9 @@ pub enum VerifierError {
     /// Unaligned immediate
     #[error("Unaligned immediate (insn #{0})")]
     UnalignedImmediate(usize),
+    /// Invalid vector op
+    #[error("invalid vector op: {1} (insn #{0})")]
+    InvalidVectorOp(usize, &'static str),
 }
 
 /// eBPF Verifier
