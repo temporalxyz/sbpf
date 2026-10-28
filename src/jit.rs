@@ -159,7 +159,7 @@ const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_VECTOR_PROLOGUE: usize = 33;
 const ANCHOR_VECTOR_TRANSLATE: usize = 34;
-const ANCHOR_COUNT: usize = 44; // Update me when adding or removing anchors
+const ANCHOR_COUNT: usize = 48; // Update me when adding or removing anchors
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -339,6 +339,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 return Err(EbpfError::UnsupportedHostFeatures(feature));
             }
             code_length_estimate += vector_jit::MAX_VECTOR_SUBROUTINES_MACHINE_CODE_LENGTH;
+            code_length_estimate += vector_jit::machine_code_length_estimate(program, executable.get_sbpf_version(), vector_registers_used);
         }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));
@@ -405,7 +406,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             let target_pc = (self.pc as isize + insn.off as isize + 1) as usize;
 
             match insn.opc {
-                ebpf::CALL_IMM if self.vector_registers_used != 0 && insn.src == crate::vector::VECTOR_OP_SRC => self.emit_vector_op(&insn),
+                ebpf::CALL_IMM if self.vector_registers_used != 0 && insn.src == crate::vector::VECTOR_OP_SRC => self.emit_vector_op(&insn)?,
                 ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
                     self.emit_validate_and_profile_instruction_count(self.pc + 2);
                     self.pc += 1;
