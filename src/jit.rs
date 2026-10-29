@@ -159,7 +159,8 @@ const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_VECTOR_PROLOGUE: usize = 33;
 const ANCHOR_VECTOR_TRANSLATE: usize = 34;
-const ANCHOR_COUNT: usize = 48; // Update me when adding or removing anchors
+const ANCHOR_VECTOR_DESCRIPTOR: usize = 48;
+const ANCHOR_COUNT: usize = 49; // Update me when adding or removing anchors
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -299,6 +300,13 @@ pub struct JitCompiler<'a, C: ContextObject> {
     vector_registers_used: u32,
     /// See [vector_jit::MemoryRuns]
     vector_memory_runs: vector_jit::MemoryRuns,
+    /// See [crate::vector::resolve_descriptor_calls]
+    vector_descriptor_calls: std::collections::HashMap<usize, (crate::vector::VectorInsn, u64)>,
+    /// Host registers of the scalar input and the mask of the vector op being emitted
+    vector_scalar_registers: [X86Register; 2],
+    /// Inline `call sol_avx512` whose slow path call is emitted after the program: text section
+    /// offset of the rel32 of the jump to it, pc and the offset to resume at
+    vector_descriptor_stubs: Vec<(usize, usize, usize)>,
 }
 
 #[rustfmt::skip]
@@ -329,8 +337,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if let Some(q) = pc.checked_div(config.instruction_meter_checkpoint_distance) {
             code_length_estimate += q * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
+        let vector_descriptor_calls = if config.enable_vector_ops {
+            crate::vector::resolve_descriptor_calls(program, executable.get_sbpf_version(), executable.get_ro_section_vm_addr(), executable.get_ro_section())
+        } else {
+            Default::default()
+        };
         let vector_registers_used = if config.enable_vector_ops {
-            crate::vector::registers_used_by_program(program, executable.get_sbpf_version())
+            crate::vector::registers_used_by_program(program, executable.get_sbpf_version(), &vector_descriptor_calls)
         } else {
             0
         };
@@ -338,7 +351,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // BuiltinProgram::new_loader checked the host
             debug_assert!(crate::vector::missing_host_feature().is_none());
             code_length_estimate += vector_jit::MAX_VECTOR_SUBROUTINES_MACHINE_CODE_LENGTH;
-            code_length_estimate += vector_jit::machine_code_length_estimate(program, executable.get_sbpf_version(), vector_registers_used);
+            code_length_estimate += vector_jit::machine_code_length_estimate(program, executable.get_sbpf_version(), vector_registers_used, &vector_descriptor_calls);
             if code_length_estimate >= i32::MAX as usize {
                 return Err(EbpfError::ExhaustedTextSegment(pc));
             }
@@ -369,6 +382,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             stopwatch_is_active: false,
             vector_registers_used,
             vector_memory_runs: vector_jit::MemoryRuns::default(),
+            vector_descriptor_calls,
+            vector_scalar_registers: [REGISTER_MAP[1], REGISTER_MAP[2]],
+            vector_descriptor_stubs: Vec::new(),
         })
     }
 
@@ -409,8 +425,19 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
             match insn.opc {
                 ebpf::CALL_IMM if self.vector_registers_used != 0 && insn.src == crate::vector::VECTOR_OP_SRC => self.emit_vector_op(&insn)?,
+                ebpf::CALL_IMM if crate::vector::is_descriptor_call(&insn, self.config.enable_vector_ops, self.executable.get_sbpf_version()) => self.emit_descriptor_call()?,
                 ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
-                    self.emit_validate_and_profile_instruction_count(self.pc + 2);
+                    // A load which vector_pair_one_cu charges as part of the call costs nothing
+                    // and checks the meter without REGISTER_SCRATCH, which may hold a memory run
+                    if crate::vector::is_free_descriptor_load(self.program, self.pc, self.config, self.executable.get_sbpf_version()) {
+                        if self.config.enable_instruction_meter {
+                            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, REGISTER_INSTRUCTION_METER, self.pc as i64, None));
+                            self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6)));
+                        }
+                        self.emit_profile_instruction_count(self.pc + 3);
+                    } else {
+                        self.emit_validate_and_profile_instruction_count(self.pc + 2);
+                    }
                     self.pc += 1;
                     let unsupported_offset = unsafe { self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION].offset_from(self.result.text_section().as_ptr()) as u32 };
                     self.result.pc_section_mut()[self.pc] = unsupported_offset;
@@ -838,6 +865,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64)); // Save pc
         self.emit_set_exception_kind(EbpfError::ExecutionOverrun);
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
+        self.emit_descriptor_stubs()?;
 
         self.resolve_jumps();
         if self.vector_registers_used != 0 {

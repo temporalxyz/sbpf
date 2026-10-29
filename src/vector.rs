@@ -726,6 +726,160 @@ pub fn is_vector_op(insn: &ebpf::Insn, enable_vector_ops: bool, sbpf_version: SB
         && sbpf_version.static_syscalls()
 }
 
+/// Syscall of the descriptor encoding: `call sol_avx512` (`src = 0`) runs the vector op described
+/// by the [DESCRIPTOR_SIZE] bytes at `r1`, with `r2` as the scalar input (the `r1` of the
+/// `src = 2` encoding), `r3` as the mask (its `r2`) and the same `r0` rules. `r1` to `r5` are
+/// unchanged.
+pub const DESCRIPTOR_SYSCALL: &str = "sol_avx512";
+
+/// Registered as [DESCRIPTOR_SYSCALL] by loaders with [Config::enable_vector_ops], so that
+/// programs calling it pass the syscall checks
+pub struct DescriptorSyscall;
+
+impl<C: ContextObject> crate::program::BuiltinFunctionDefinition<C> for DescriptorSyscall {
+    type Error = EbpfError;
+
+    fn rust(_: &mut C, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, EbpfError> {
+        Err(EbpfError::UnsupportedInstruction)
+    }
+}
+
+/// Size of a descriptor: op, imm8, out, in0, in1, mask mode, i16 off, then 8 bytes which must be 0
+pub const DESCRIPTOR_SIZE: usize = 16;
+
+/// The `imm` of `call sol_avx512`
+pub fn descriptor_syscall_hash() -> u32 {
+    static HASH: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| ebpf::hash_symbol_name(DESCRIPTOR_SYSCALL.as_bytes()));
+    *HASH
+}
+
+/// Encodes a vector op as a descriptor
+pub const fn encode_descriptor(
+    op: u8,
+    imm8: u8,
+    out: u8,
+    in0: u8,
+    in1: u8,
+    off: i16,
+    mode: u8,
+) -> [u8; DESCRIPTOR_SIZE] {
+    let off = off.to_le_bytes();
+    [
+        op, imm8, out, in0, in1, mode, off[0], off[1], 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+}
+
+/// Whether `insn` is `call sol_avx512` in the given setting
+#[inline]
+pub fn is_descriptor_call(
+    insn: &ebpf::Insn,
+    enable_vector_ops: bool,
+    sbpf_version: SBPFVersion,
+) -> bool {
+    insn.opc == ebpf::CALL_IMM
+        && insn.src == 0
+        && enable_vector_ops
+        && sbpf_version.static_syscalls()
+        && insn.imm as u32 == descriptor_syscall_hash()
+}
+
+/// Whether the instruction at `pc` is a `lddw r1, imm` directly followed by `call sol_avx512`,
+/// which [Config::vector_pair_one_cu] charges as part of the call
+pub(crate) fn is_free_descriptor_load(
+    prog: &[u8],
+    pc: usize,
+    config: &Config,
+    sbpf_version: SBPFVersion,
+) -> bool {
+    if !config.vector_pair_one_cu || (pc + 3) * ebpf::INSN_SIZE > prog.len() {
+        return false;
+    }
+    let load = ebpf::get_insn_unchecked(prog, pc);
+    load.opc == ebpf::LD_DW_IMM
+        && load.dst == 1
+        && !sbpf_version.disable_lddw()
+        && is_descriptor_call(
+            &ebpf::get_insn_unchecked(prog, pc + 2),
+            config.enable_vector_ops,
+            sbpf_version,
+        )
+}
+
+/// The vector op of each `call sol_avx512` whose `r1` is likely known at compile time, by pc,
+/// with the address of its descriptor
+///
+/// One pass in program order tracks the constants loaded by `lddw` and `mov64`, copied by `mov64`
+/// between registers and through 8 byte stack slots (spills), and ignores control flow, so this is
+/// only a guess. The JIT emits the op inline behind a runtime check of `r1` and calls the slow
+/// path otherwise.
+pub(crate) fn resolve_descriptor_calls(
+    prog: &[u8],
+    sbpf_version: SBPFVersion,
+    ro_vm_addr: u64,
+    ro: &[u8],
+) -> std::collections::HashMap<usize, (VectorInsn, u64)> {
+    let mut resolved = std::collections::HashMap::new();
+    let mut known = [None::<u64>; 11];
+    let mut stack = std::collections::HashMap::<i16, u64>::new();
+    let mut pc: usize = 0;
+    while (pc + 1) * ebpf::INSN_SIZE <= prog.len() {
+        let mut insn = ebpf::get_insn_unchecked(prog, pc);
+        let dst = (insn.dst as usize).min(10);
+        let class = insn.opc & ebpf::BPF_CLS_MASK;
+        if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
+            if (pc + 2) * ebpf::INSN_SIZE > prog.len() {
+                break;
+            }
+            ebpf::augment_lddw_unchecked(prog, &mut insn);
+            known[dst] = Some(insn.imm as u64);
+            pc += 2;
+            continue;
+        }
+        if is_descriptor_call(&insn, true, sbpf_version) {
+            let descriptor = known[1]
+                .and_then(|addr| addr.checked_sub(ro_vm_addr).map(|start| (addr, start)))
+                .and_then(|(addr, start)| {
+                    let start = if start <= ro.len() as u64 {
+                        start as usize
+                    } else {
+                        return None;
+                    };
+                    let bytes = ro.get(start..start.checked_add(DESCRIPTOR_SIZE)?)?;
+                    let v =
+                        VectorInsn::from_descriptor(std::convert::TryInto::try_into(bytes).ok()?)
+                            .ok()?;
+                    Some((v, addr))
+                });
+            if let Some(descriptor) = descriptor {
+                resolved.insert(pc, descriptor);
+            }
+            known[0] = None;
+        } else if insn.opc == ebpf::MOV64_IMM {
+            known[dst] = Some(insn.imm as u64);
+        } else if insn.opc == ebpf::MOV64_REG {
+            known[dst] = known[(insn.src as usize).min(10)];
+        } else if insn.opc == ebpf::LD_DW_REG && insn.src == 10 {
+            known[dst] = stack.get(&insn.off).copied();
+        } else if matches!(class, ebpf::BPF_ST | ebpf::BPF_STX) && insn.dst == 10 {
+            stack.retain(|off, _| off.abs_diff(insn.off) >= 8);
+            if let (ebpf::ST_DW_REG, Some(value)) = (insn.opc, known[(insn.src as usize).min(10)]) {
+                stack.insert(insn.off, value);
+            }
+        } else if insn.opc == ebpf::CALL_IMM || insn.opc == ebpf::CALL_REG {
+            known[..6].fill(None);
+        } else if !matches!(
+            class,
+            ebpf::BPF_ST | ebpf::BPF_STX | ebpf::BPF_JMP64 | ebpf::BPF_JMP32
+        ) || sbpf_version.move_memory_instruction_classes()
+        {
+            known[dst] = None;
+        }
+        pc += 1;
+    }
+    resolved
+}
+
 /// Checks that the host CPU has every feature the vector ops require (see SPEC.md).
 ///
 /// [BuiltinProgram::new_loader](crate::program::BuiltinProgram::new_loader) refuses a config with
@@ -864,6 +1018,46 @@ impl VectorInsn {
         })
     }
 
+    /// Decodes and validates a descriptor (see [DESCRIPTOR_SIZE]) with the rules of [Self::decode]
+    pub fn from_descriptor(bytes: &[u8; DESCRIPTOR_SIZE]) -> Result<Self, &'static str> {
+        let [op, imm8, out, in0, in1, mode, off0, off1, reserved @ ..] = *bytes;
+        if reserved != [0; 8] {
+            return Err("reserved descriptor bytes must be 0");
+        }
+        if out >= 32 || in0 >= 32 || in1 >= 32 {
+            return Err("register field out of range");
+        }
+        if mode >= 16 {
+            return Err("mask mode out of range");
+        }
+        let imm = (op as u32) << 24
+            | (imm8 as u32) << 16
+            | (out as u32) << 10
+            | (in0 as u32) << 5
+            | in1 as u32;
+        Self::decode(&ebpf::Insn {
+            ptr: 0,
+            opc: ebpf::CALL_IMM,
+            dst: mode,
+            src: VECTOR_OP_SRC,
+            off: i16::from_le_bytes([off0, off1]),
+            imm: imm as i32 as i64,
+        })
+    }
+
+    /// The `src = 2` encoding of this op
+    pub fn encode(&self) -> u64 {
+        encode_masked(
+            self.info.op,
+            self.imm8,
+            self.out,
+            self.in0,
+            self.in1,
+            self.off,
+            self.mode,
+        )
+    }
+
     /// Number of consecutive registers named by `out` or `in0` (`ldn`, `stn`: imm8)
     pub fn register_count(&self) -> u8 {
         if self.info.imm8_is_count() {
@@ -978,23 +1172,41 @@ pub(crate) fn verify(
     prog: &[u8],
     config: &Config,
     sbpf_version: SBPFVersion,
+    ro_vm_addr: u64,
+    ro: &[u8],
 ) -> Result<(), VerifierError> {
+    let descriptor_calls = resolve_descriptor_calls(prog, sbpf_version, ro_vm_addr, ro);
     let mut machine_code_length = 0;
     let mut insn_ptr: usize = 0;
     while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
         let insn = ebpf::get_insn(prog, insn_ptr);
         if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
             insn_ptr += 1;
-        } else if is_vector_op(&insn, true, sbpf_version) {
-            let v = VectorInsn::decode(&insn)
-                .map_err(|reason| VerifierError::InvalidVectorOp(insn_ptr, reason))?;
+        } else if is_vector_op(&insn, true, sbpf_version)
+            || is_descriptor_call(&insn, true, sbpf_version)
+        {
+            let length = if insn.src == VECTOR_OP_SRC {
+                VectorInsn::decode(&insn)
+                    .map_err(|reason| VerifierError::InvalidVectorOp(insn_ptr, reason))?
+                    .max_machine_code_length()
+            } else if insn.dst != 0 || insn.off != 0 {
+                return Err(VerifierError::InvalidVectorOp(
+                    insn_ptr,
+                    "call sol_avx512 must have dst and off 0",
+                ));
+            } else {
+                DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
+                    + descriptor_calls
+                        .get(&insn_ptr)
+                        .map_or(0, |(v, _)| v.max_machine_code_length())
+            };
             if !aligned_memory_mapping(config, sbpf_version) {
                 return Err(VerifierError::InvalidVectorOp(
                     insn_ptr,
                     "vector ops require the aligned memory mapping",
                 ));
             }
-            machine_code_length += v.max_machine_code_length();
+            machine_code_length += length;
             if machine_code_length > MAX_VECTOR_MACHINE_CODE_LENGTH {
                 return Err(VerifierError::InvalidVectorOp(
                     insn_ptr,
@@ -1007,13 +1219,27 @@ pub(crate) fn verify(
     Ok(())
 }
 
+/// Upper bound of the machine code length of the JIT for a `call sol_avx512` beyond the inline op:
+/// the check of `r1`, the call of the slow path and a free `lddw r1` before it
+pub const DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH: usize = 96;
+
 /// Set in [registers_used_by_program] if there is a vector op (some use no vector register)
 pub(crate) const PROGRAM_USES_VECTOR_OPS: u32 = 1 << 31;
 
 /// Bit set of the vector registers used by any vector op in `prog` plus
 /// [PROGRAM_USES_VECTOR_OPS], 0 if there are none
-pub(crate) fn registers_used_by_program(prog: &[u8], sbpf_version: SBPFVersion) -> u32 {
+///
+/// Of `call sol_avx512` only the ops in `descriptor_calls` count, the others run in the slow path,
+/// which works on [EbpfVm::vector_registers] only.
+pub(crate) fn registers_used_by_program(
+    prog: &[u8],
+    sbpf_version: SBPFVersion,
+    descriptor_calls: &std::collections::HashMap<usize, (VectorInsn, u64)>,
+) -> u32 {
     let mut mask = 0;
+    for (v, _) in descriptor_calls.values() {
+        mask |= v.registers_used() | PROGRAM_USES_VECTOR_OPS;
+    }
     let mut insn_ptr: usize = 0;
     while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
         let insn = ebpf::get_insn_unchecked(prog, insn_ptr);
@@ -1023,6 +1249,8 @@ pub(crate) fn registers_used_by_program(prog: &[u8], sbpf_version: SBPFVersion) 
             if let Ok(vector_insn) = VectorInsn::decode(&insn) {
                 mask |= vector_insn.registers_used() | PROGRAM_USES_VECTOR_OPS;
             }
+        } else if is_descriptor_call(&insn, true, sbpf_version) {
+            mask |= PROGRAM_USES_VECTOR_OPS;
         }
         insn_ptr += 1;
     }
@@ -2188,17 +2416,48 @@ pub(crate) fn execute<C: ContextObject>(
     insn: &ebpf::Insn,
 ) -> Result<(), EbpfError> {
     let v = VectorInsn::decode(insn).map_err(|_| EbpfError::UnsupportedInstruction)?;
+    charge_extra_cu(vm, &v)?;
+    if let Some(r0) = execute_decoded(vm, &v, reg[1], reg[2])? {
+        reg[0] = r0;
+    }
+    Ok(())
+}
+
+/// Interprets `call sol_avx512`, see [DESCRIPTOR_SYSCALL]
+pub(crate) fn execute_descriptor<C: ContextObject>(
+    vm: &mut EbpfVm<C>,
+    reg: &mut [u64; 12],
+) -> Result<(), EbpfError> {
+    let v = read_descriptor(vm, reg[1])?;
+    charge_extra_cu(vm, &v)?;
+    if let Some(r0) = execute_decoded(vm, &v, reg[2], reg[3])? {
+        reg[0] = r0;
+    }
+    Ok(())
+}
+
+/// Reads the descriptor at `vm_addr` like a scalar load of [DESCRIPTOR_SIZE] bytes and decodes it
+pub(crate) fn read_descriptor<C: ContextObject>(
+    vm: &mut EbpfVm<C>,
+    vm_addr: u64,
+) -> Result<VectorInsn, EbpfError> {
+    let host_addr = translate(vm, AccessType::Load, vm_addr, DESCRIPTOR_SIZE as u64)?;
+    let mut bytes = [0u8; DESCRIPTOR_SIZE];
+    // SAFETY: `translate` checked that the bytes at `host_addr` are mapped readable.
+    unsafe { std::ptr::copy_nonoverlapping(host_addr, bytes.as_mut_ptr(), DESCRIPTOR_SIZE) };
+    VectorInsn::from_descriptor(&bytes).map_err(|_| EbpfError::UnsupportedInstruction)
+}
+
+/// Charges the CUs of an op beyond its first, which either all fit or the op fails before any
+/// effect
+fn charge_extra_cu<C: ContextObject>(vm: &mut EbpfVm<C>, v: &VectorInsn) -> Result<(), EbpfError> {
     let cu = v.info.cu(v.imm8);
     if cu > 1 && vm.loader.get_config().enable_instruction_meter {
-        // The op either gets all its CUs or fails before any effect
         if vm.due_insn_count + (cu - 1) > vm.previous_instruction_meter {
             vm.due_insn_count = vm.previous_instruction_meter;
             return Err(EbpfError::ExceededMaxInstructions);
         }
         vm.due_insn_count += cu - 1;
-    }
-    if let Some(r0) = execute_decoded(vm, &v, reg[1], reg[2])? {
-        reg[0] = r0;
     }
     Ok(())
 }

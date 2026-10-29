@@ -27,8 +27,8 @@ use crate::{
     error::StableResult,
     memory_region::{jit_region_layout, AccessType, JitRegionTable},
     vector::{
-        self, encode_masked, gather_scatter_shape, op, Kind, Mask, VectorInsn, VECTOR_OP_SRC,
-        VECTOR_REGISTERS, VECTOR_SIZE,
+        self, encode_masked, gather_scatter_shape, op, Kind, Mask, VectorInsn,
+        DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH, VECTOR_OP_SRC, VECTOR_REGISTERS, VECTOR_SIZE,
     },
     vm::EncryptedHostAddressToEbpfVm,
     x86_evex::{
@@ -107,6 +107,58 @@ extern "C" fn vector_slow_path<C: ContextObject>(
                 Ok(_) => ProgramResult::Ok(0),
                 Err(err) => ProgramResult::Err(err),
             };
+        })
+    }
+}
+
+/// First half of the slow path of `call sol_avx512`: reads and decodes the descriptor at `r1`.
+/// Writes the `src = 2` encoding of the op (or the error) to [EbpfVm::program_result] and returns
+/// the CUs of the op.
+extern "C" fn descriptor_slow_path_decode<C: ContextObject>(
+    mut vm: EncryptedHostAddressToEbpfVm<C>,
+    r1: u64,
+) -> u64 {
+    #[cfg(test)]
+    SLOW_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    // SAFETY: called from the JIT code of this VM, which holds no other reference to it
+    unsafe {
+        vm.with_vm(|vm| match vector::read_descriptor(vm, r1) {
+            Ok(v) => {
+                vm.program_result = ProgramResult::Ok(v.encode());
+                v.info.cu(v.imm8)
+            }
+            Err(err) => {
+                vm.program_result = ProgramResult::Err(err);
+                0
+            }
+        })
+    }
+}
+
+/// Second half of the slow path of `call sol_avx512`: executes the op like the interpreter
+/// (without CUs), writes the result to [EbpfVm::program_result] and returns the new `r0`
+extern "C" fn descriptor_slow_path_execute<C: ContextObject>(
+    mut vm: EncryptedHostAddressToEbpfVm<C>,
+    r2: u64,
+    r3: u64,
+    word: u64,
+    r0: u64,
+) -> u64 {
+    // SAFETY: called from the JIT code of this VM, which holds no other reference to it
+    unsafe {
+        vm.with_vm(|vm| {
+            let insn = ebpf::get_insn(&word.to_le_bytes(), 0);
+            let v = VectorInsn::decode(&insn).unwrap();
+            match vector::execute_decoded(vm, &v, r2, r3) {
+                Ok(result) => {
+                    vm.program_result = ProgramResult::Ok(0);
+                    result.unwrap_or(r0)
+                }
+                Err(err) => {
+                    vm.program_result = ProgramResult::Err(err);
+                    r0
+                }
+            }
         })
     }
 }
@@ -229,13 +281,26 @@ pub(crate) struct Lowering {
     pub(crate) instructions: Vec<HostInstruction>,
 }
 
+/// Host registers of the scalar input and the mask of the `src = 2` encoding
+const SCALAR_REGISTERS: [X86Register; 2] = [REGISTER_MAP[1], REGISTER_MAP[2]];
+
+/// Host registers of the scalar input and the mask of `call sol_avx512`
+const DESCRIPTOR_SCALAR_REGISTERS: [X86Register; 2] = [REGISTER_MAP[2], REGISTER_MAP[3]];
+
 /// Lowers a vector op to AVX-512, see the avx-512 column of the spec
+#[cfg(test)]
 pub(crate) fn lower(v: &VectorInsn) -> Lowering {
+    lower_with(v, SCALAR_REGISTERS)
+}
+
+/// Lowers a vector op to AVX-512 with the scalar input and the mask in the given host registers,
+/// see the avx-512 column of the spec
+fn lower_with(v: &VectorInsn, scalar: [X86Register; 2]) -> Lowering {
     use HostInstruction::Evex;
     type E = EvexInstruction;
     let (o, a, b, imm8) = (v.out, v.in0, v.in1, v.imm8);
     let r0 = REGISTER_MAP[0];
-    let r1 = REGISTER_MAP[1] as u8;
+    let r1 = scalar[0] as u8;
     // out ← f(in0, in1)
     let binary = |map, w, opcode| vec![Evex(E::rrr(P66, map, w, opcode, o, a, b))];
     // out ← f(in0)
@@ -248,7 +313,7 @@ pub(crate) fn lower(v: &VectorInsn) -> Lowering {
         |compare: E, w, opcode| vec![Evex(compare), Evex(E::rr(PF3, M0F38, w, opcode, o, K1))];
     // out ← narrowing conversion of in0, which is the ModRM.reg operand
     let narrow = |opcode| vec![Evex(E::rr(PF3, M0F38, false, opcode, a, o))];
-    let r2 = REGISTER_MAP[2];
+    let r2 = scalar[1];
     let load = |instruction: E| vec![Evex(instruction.mem(REGISTER_SCRATCH, 0))];
     // vmovdqu8/16/32/64 for the lane width code in imm8
     let vmovdqu = |opcode, reg| {
@@ -786,8 +851,13 @@ fn memory_access(v: &VectorInsn) -> Option<(AccessType, u64)> {
 /// can choose too). Those two bytes decode as a `jmp` or `call` to a guest register. The source
 /// in such a ModRM field is moved to zmm30 first.
 fn lower_sanitized(v: &VectorInsn) -> Lowering {
+    lower_sanitized_with(v, SCALAR_REGISTERS)
+}
+
+/// [lower_sanitized] with the scalar input and the mask in the given host registers
+fn lower_sanitized_with(v: &VectorInsn, scalar: [X86Register; 2]) -> Lowering {
     use HostInstruction::Evex;
-    let lowering = lower(v);
+    let lowering = lower_with(v, scalar);
     let uses_zmm30 = lowering.instructions.iter().any(|instruction| {
         matches!(instruction, Evex(evex)
             if evex.reg == ZMM30 || evex.vvvv == ZMM30 || evex.rm == Rm::Reg(ZMM30))
@@ -1197,6 +1267,7 @@ pub(super) fn machine_code_length_estimate(
     prog: &[u8],
     sbpf_version: crate::program::SBPFVersion,
     registers_used: u32,
+    descriptor_calls: &std::collections::HashMap<usize, (VectorInsn, u64)>,
 ) -> usize {
     let mut length = 0;
     let mut insn_ptr: usize = 0;
@@ -1207,6 +1278,11 @@ pub(super) fn machine_code_length_estimate(
         } else if vector::is_vector_op(&insn, true, sbpf_version) {
             if let Ok(v) = VectorInsn::decode(&insn) {
                 length += max_machine_code_length(&v, registers_used);
+            }
+        } else if vector::is_descriptor_call(&insn, true, sbpf_version) {
+            length += DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH;
+            if let Some((v, _)) = descriptor_calls.get(&insn_ptr) {
+                length += max_machine_code_length(v, registers_used);
             }
         }
         insn_ptr += 1;
@@ -1245,9 +1321,9 @@ impl<C: ContextObject> JitCompiler<'_, C> {
     /// [lower] or, with sanitized user values, [lower_sanitized]
     fn lower(&self, v: &VectorInsn) -> Lowering {
         if self.config.sanitize_user_provided_values {
-            lower_sanitized(v)
+            lower_sanitized_with(v, self.vector_scalar_registers)
         } else {
-            lower(v)
+            lower_with(v, self.vector_scalar_registers)
         }
     }
 
@@ -1270,7 +1346,118 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             ));
             return Ok(());
         };
-        let budget = max_machine_code_length(&vector_insn, self.vector_registers_used);
+        self.emit_vector_insn(vector_insn, 0)
+    }
+
+    /// `call sol_avx512`: if [vector::resolve_descriptor_calls] found the op, it is emitted inline
+    /// behind a check that `r1` is the address of its descriptor. Otherwise, or if `r1` differs
+    /// (out of line), the slow path subroutine reads the descriptor at `r1`.
+    pub(super) fn emit_descriptor_call(&mut self) -> Result<(), EbpfError> {
+        let pc = self.pc;
+        if let Some(&(v, addr)) = self.descriptor_call(pc) {
+            self.emit_descriptor_guard(addr);
+            let slow_path = self.offset_in_text_section + 2;
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne slow path
+            self.vector_scalar_registers = DESCRIPTOR_SCALAR_REGISTERS;
+            let result = self.emit_vector_insn(v, DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH);
+            self.vector_scalar_registers = SCALAR_REGISTERS;
+            result?;
+            self.vector_descriptor_stubs
+                .push((slow_path, pc, self.offset_in_text_section));
+            return Ok(());
+        }
+        if self.offset_in_text_section + DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
+            >= self.result.text_section().len()
+        {
+            return Err(EbpfError::ExhaustedTextSegment(pc));
+        }
+        self.emit_descriptor_slow_path_call(pc);
+        Ok(())
+    }
+
+    /// Calls the slow path subroutine of the `call sol_avx512` at `pc`
+    fn emit_descriptor_slow_path_call(&mut self, pc: usize) {
+        self.emit_ins(X86Instruction::store_immediate(
+            OperandSize::S64,
+            RSP,
+            X86IndirectAccess::OffsetIndexShift(-16, RSP, 0),
+            pc as i64,
+        ));
+        self.emit_ins(X86Instruction::call_immediate(
+            self.relative_to_anchor(ANCHOR_VECTOR_DESCRIPTOR, 5),
+        ));
+    }
+
+    /// The slow path calls of the inline `call sol_avx512`, out of line after the program
+    pub(super) fn emit_descriptor_stubs(&mut self) -> Result<(), EbpfError> {
+        for (jump, pc, resume) in std::mem::take(&mut self.vector_descriptor_stubs) {
+            if self.offset_in_text_section + DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
+                >= self.result.text_section().len()
+            {
+                return Err(EbpfError::ExhaustedTextSegment(pc));
+            }
+            self.patch_rel32(jump);
+            self.emit_descriptor_slow_path_call(pc);
+            self.emit_ins(X86Instruction::jump_immediate(
+                self.relative_to_offset(resume, 5),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The op and descriptor address of the `call sol_avx512` at `pc` if it is emitted inline
+    fn descriptor_call(&self, pc: usize) -> Option<&(VectorInsn, u64)> {
+        // emit_descriptor_guard needs the address in 30 bits
+        self.vector_descriptor_calls
+            .get(&pc)
+            .filter(|(_, addr)| *addr < 1 << 30)
+    }
+
+    /// Sets ZF if `r1` is `addr`, without REGISTER_SCRATCH (which may hold a memory run) and
+    /// without user provided immediates if they are sanitized
+    fn emit_descriptor_guard(&mut self, addr: u64) {
+        if self.should_sanitize_constant(addr as i64) {
+            let key = (self.immediate_value_key as i32 >> 1) as i64;
+            let blinded = addr as i64 - key;
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                5,
+                REGISTER_MAP[1],
+                blinded,
+                None,
+            ));
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S64,
+                REGISTER_MAP[1],
+                key,
+                None,
+            ));
+            // lea keeps the flags
+            self.emit_ins(X86Instruction::lea(
+                OperandSize::S64,
+                REGISTER_MAP[1],
+                REGISTER_MAP[1],
+                Some(X86IndirectAccess::Offset(blinded as i32)),
+            ));
+        } else {
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S64,
+                REGISTER_MAP[1],
+                addr as i64,
+                None,
+            ));
+        }
+    }
+
+    /// Emits a decoded vector op, `extra_budget` is machine code emitted around it
+    fn emit_vector_insn(
+        &mut self,
+        vector_insn: VectorInsn,
+        extra_budget: usize,
+    ) -> Result<(), EbpfError> {
+        let budget =
+            max_machine_code_length(&vector_insn, self.vector_registers_used) + extra_budget;
         if self.offset_in_text_section + budget >= self.result.text_section().len() {
             return Err(EbpfError::ExhaustedTextSegment(self.pc));
         }
@@ -1414,7 +1601,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
                 unreachable!("ldn and stn are vmovdqu64 only");
             };
             let off = v.off as i64 + (k * VECTOR_SIZE) as i64;
-            self.emit_vm_address(REGISTER_MAP[1], off, true);
+            self.emit_vm_address(self.vector_scalar_registers[0], off, true);
             self.emit_vector_translation_call(access_type, VECTOR_SIZE as u64, pc);
             self.emit_host_instruction(&HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, 0)));
         }
@@ -1441,17 +1628,18 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         self.emit_rust_call(
             Value::Constant64(vector_slow_path::<C> as *const u8 as i64, false),
             &[
+                // In this order, the scalar registers may be the next argument registers
                 Argument {
-                    index: 3,
-                    value: Value::Register(REGISTER_SCRATCH),
+                    index: 1,
+                    value: Value::Register(self.vector_scalar_registers[0]),
                 },
                 Argument {
                     index: 2,
-                    value: Value::Register(REGISTER_MAP[2]),
+                    value: Value::Register(self.vector_scalar_registers[1]),
                 },
                 Argument {
-                    index: 1,
-                    value: Value::Register(REGISTER_MAP[1]),
+                    index: 3,
+                    value: Value::Register(REGISTER_SCRATCH),
                 },
                 Argument {
                     index: 0,
@@ -1484,7 +1672,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         if v.mode == 0 {
             self.emit_bytes(&kxnorq(K3, K3, K3));
         } else {
-            self.emit_bytes(&kmovq_from_gpr(K3, REGISTER_MAP[2]));
+            self.emit_bytes(&kmovq_from_gpr(K3, self.vector_scalar_registers[1]));
             self.emit_bytes(&kortest(lanes, K3, K3));
             empty = Some(self.offset_in_text_section + 2);
             self.emit_ins(X86Instruction::conditional_jump_immediate(0x84, 0)); // jz empty
@@ -1670,11 +1858,11 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         if off == 0 {
             self.emit_ins(X86Instruction::mov(
                 OperandSize::S64,
-                REGISTER_MAP[1],
+                self.vector_scalar_registers[0],
                 REGISTER_SCRATCH,
             ));
         } else {
-            self.emit_vm_address(REGISTER_MAP[1], off as i64, true);
+            self.emit_vm_address(self.vector_scalar_registers[0], off as i64, true);
         }
     }
 
@@ -1707,7 +1895,12 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             // Over-approximates: every other jump class instruction marks pc + off + 1, calls also
             // pc + imm + 1
             let class = insn.opc & ebpf::BPF_CLS_MASK;
-            let vector_op = insn.opc == ebpf::CALL_IMM && insn.src == VECTOR_OP_SRC;
+            let vector_op = insn.opc == ebpf::CALL_IMM && insn.src == VECTOR_OP_SRC
+                || vector::is_descriptor_call(
+                    &insn,
+                    self.config.enable_vector_ops,
+                    self.executable.get_sbpf_version(),
+                );
             if (class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32) && !vector_op {
                 mark(pc as i64 + insn.off as i64 + 1);
                 if insn.opc == ebpf::CALL_IMM {
@@ -1746,6 +1939,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         } else {
             usize::MAX
         };
+        let descriptor = self.descriptor_call(self.pc).is_some();
         let (mut end, mut accesses, mut stores) = (self.pc, 0, false);
         let mut worst_case_length = 0;
         let (mut min_off, mut max_end) = (i64::MAX, i64::MIN);
@@ -1754,11 +1948,32 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             && (pc == self.pc || (pc < limit && !self.vector_memory_runs.jump_targets[pc]))
         {
             let insn = ebpf::get_insn_unchecked(self.program, pc);
-            if insn.opc != ebpf::CALL_IMM || insn.src != VECTOR_OP_SRC {
-                break;
-            }
-            let Ok(vector_insn) = VectorInsn::decode(&insn) else {
-                break;
+            // A run is either all `src = 2` ops or all inline `call sol_avx512`, which may be
+            // preceded by a free `lddw r1` (which leaves `r2`, their scalar input, unchanged)
+            let vector_insn = if descriptor {
+                if vector::is_free_descriptor_load(
+                    self.program,
+                    pc,
+                    self.config,
+                    self.executable.get_sbpf_version(),
+                ) && self.descriptor_call(pc + 2).is_some()
+                {
+                    pc += 2;
+                    continue;
+                }
+                let Some((vector_insn, _)) = self.descriptor_call(pc) else {
+                    break;
+                };
+                worst_case_length += DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH;
+                *vector_insn
+            } else {
+                if insn.opc != ebpf::CALL_IMM || insn.src != VECTOR_OP_SRC {
+                    break;
+                }
+                let Ok(vector_insn) = VectorInsn::decode(&insn) else {
+                    break;
+                };
+                vector_insn
             };
             // Gathers and scatters use REGISTER_SCRATCH
             if matches!(vector_insn.info.kind, Kind::Ga | Kind::Sc) {
@@ -1870,6 +2085,181 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             ));
         }
         self.patch_rel32(skip);
+    }
+
+    /// Slow path subroutine of `call sol_avx512`
+    ///
+    /// Input: guest pc in X86IndirectAccess::OffsetIndexShift(-8, RSP, 0). Runs the op of the
+    /// descriptor at `r1` like the interpreter, or throws its error.
+    fn emit_descriptor_slow_path(&mut self) {
+        self.set_anchor(ANCHOR_VECTOR_DESCRIPTOR);
+        // The pc slot and padding: emit_rust_call with a result register pushes one register less
+        // than the translation subroutines, which keeps the stack aligned
+        let pc_on_stack = X86IndirectAccess::OffsetIndexShift(8, RSP, 0);
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0x81,
+            5,
+            RSP,
+            16,
+            None,
+        ));
+        self.emit_rust_call(
+            Value::Constant64(descriptor_slow_path_decode::<C> as *const u8 as i64, false),
+            &[
+                Argument {
+                    index: 1,
+                    value: Value::Register(REGISTER_MAP[1]),
+                },
+                Argument {
+                    index: 0,
+                    value: Value::Register(REGISTER_PTR_TO_VM),
+                },
+            ],
+            Some(REGISTER_SCRATCH),
+        );
+        self.emit_check_result_is_ok();
+        let mut errors = vec![self.offset_in_text_section + 2];
+        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne error
+        if self.config.enable_instruction_meter {
+            // REGISTER_SCRATCH = cu: as emit_vector_cu_check
+            self.emit_ins(X86Instruction::cmp_immediate(
+                OperandSize::S64,
+                REGISTER_SCRATCH,
+                1,
+                None,
+            ));
+            let single = self.offset_in_text_section + 2;
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, 0)); // jbe single
+            self.emit_ins(X86Instruction::alu_immediate(
+                OperandSize::S64,
+                0x81,
+                5,
+                REGISTER_SCRATCH,
+                1,
+                None,
+            ));
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x03,
+                REGISTER_SCRATCH,
+                RSP,
+                Some(pc_on_stack),
+            )); // REGISTER_SCRATCH = pc + cu - 1
+            self.emit_ins(X86Instruction::cmp(
+                OperandSize::S64,
+                REGISTER_SCRATCH,
+                REGISTER_INSTRUCTION_METER,
+                None,
+            ));
+            let covered = self.offset_in_text_section + 2;
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x87, 0)); // ja covered
+            self.emit_ins(X86Instruction::load(
+                OperandSize::S64,
+                RSP,
+                REGISTER_SCRATCH,
+                pc_on_stack,
+            ));
+            self.emit_ins(X86Instruction::cmp(
+                OperandSize::S64,
+                REGISTER_SCRATCH,
+                REGISTER_INSTRUCTION_METER,
+                None,
+            ));
+            // Ran out before this op: the meter already holds the pc to report
+            self.emit_ins(X86Instruction::conditional_jump_immediate(
+                0x86,
+                self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6),
+            ));
+            self.emit_ins(X86Instruction::mov(
+                OperandSize::S64,
+                REGISTER_SCRATCH,
+                REGISTER_INSTRUCTION_METER,
+            ));
+            self.emit_ins(X86Instruction::jump_immediate(
+                self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 5),
+            ));
+            self.patch_rel32(covered);
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x2B,
+                REGISTER_SCRATCH,
+                RSP,
+                Some(pc_on_stack),
+            )); // REGISTER_SCRATCH = cu - 1
+            self.emit_ins(X86Instruction::alu(
+                OperandSize::S64,
+                0x29,
+                REGISTER_SCRATCH,
+                REGISTER_INSTRUCTION_METER,
+                None,
+            ));
+            self.patch_rel32(single);
+        }
+        self.emit_rust_call(
+            Value::Constant64(descriptor_slow_path_execute::<C> as *const u8 as i64, false),
+            &[
+                // In this order, the scalar registers are the next argument registers
+                Argument {
+                    index: 1,
+                    value: Value::Register(REGISTER_MAP[2]),
+                },
+                Argument {
+                    index: 2,
+                    value: Value::Register(REGISTER_MAP[3]),
+                },
+                Argument {
+                    index: 3,
+                    value: Value::RegisterIndirect(
+                        REGISTER_PTR_TO_VM,
+                        self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult)
+                            + std::mem::size_of::<u64>() as i32,
+                        false,
+                    ),
+                },
+                Argument {
+                    index: 4,
+                    value: Value::Register(REGISTER_MAP[0]),
+                },
+                Argument {
+                    index: 0,
+                    value: Value::Register(REGISTER_PTR_TO_VM),
+                },
+            ],
+            Some(REGISTER_MAP[0]),
+        );
+        self.emit_check_result_is_ok();
+        errors.push(self.offset_in_text_section + 2);
+        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne error
+        self.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0x81,
+            0,
+            RSP,
+            16,
+            None,
+        ));
+        // Inside a memory run the following accesses take their fallbacks
+        self.emit_ins(X86Instruction::alu(
+            OperandSize::S32,
+            0x31,
+            REGISTER_SCRATCH,
+            REGISTER_SCRATCH,
+            None,
+        ));
+        self.emit_ins(X86Instruction::return_near());
+        for error in errors {
+            self.patch_rel32(error);
+        }
+        self.emit_ins(X86Instruction::load(
+            OperandSize::S64,
+            RSP,
+            REGISTER_SCRATCH,
+            pc_on_stack,
+        )); // REGISTER_SCRATCH = pc
+        self.emit_ins(X86Instruction::jump_immediate(
+            self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5),
+        ));
     }
 
     /// Points the rel32 at `location` to the current offset
@@ -2033,6 +2423,8 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         let jump_offset =
             self.relative_to_target_pc(self.executable.get_entrypoint_instruction_offset(), 5);
         self.emit_ins(X86Instruction::jump_immediate(jump_offset));
+
+        self.emit_descriptor_slow_path();
 
         // Translation subroutines
         // Input: vm address in REGISTER_SCRATCH, guest pc in X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)

@@ -142,6 +142,9 @@ pub struct Config {
     /// Enables the 512-bit vector ops (`CALL_IMM` with `src = 2`) for SBPF versions with
     /// static syscalls, see [crate::vector]
     pub enable_vector_ops: bool,
+    /// Charges a `lddw r1, imm` directly followed by `call sol_avx512` as part of the call, so the
+    /// pair costs the CUs of the vector op alone, see [crate::vector]
+    pub vector_pair_one_cu: bool,
 }
 
 impl Config {
@@ -170,6 +173,7 @@ impl Default for Config {
             enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
             aligned_region_size: ebpf::MM_REGION_SIZE as usize,
             enable_vector_ops: false,
+            vector_pair_one_cu: true,
         }
     }
 }
@@ -190,6 +194,25 @@ impl<C: ContextObject> Executable<C> {
     ) -> Result<Self, EbpfError> {
         Executable::new_from_text_bytes(text_bytes, loader, sbpf_version, function_registry)
             .map_err(EbpfError::ElfError)
+    }
+
+    /// Creates an executable from raw text section bytes and a separate read-only section at
+    /// [ebpf::MM_RODATA_START] (SBPF versions with lower rodata vaddrs)
+    pub fn from_text_and_rodata_bytes(
+        text_bytes: &[u8],
+        rodata: &[u8],
+        loader: Arc<BuiltinProgram<C>>,
+        sbpf_version: SBPFVersion,
+        function_registry: FunctionRegistry<usize>,
+    ) -> Result<Self, EbpfError> {
+        Executable::new_from_text_and_rodata_bytes(
+            text_bytes,
+            rodata,
+            loader,
+            sbpf_version,
+            function_registry,
+        )
+        .map_err(EbpfError::ElfError)
     }
 }
 

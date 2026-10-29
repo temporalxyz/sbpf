@@ -495,10 +495,20 @@ impl<C: ContextObject> BuiltinProgram<C> {
                 panic!("{}", err);
             }
         }
-        Self {
+        let enable_vector_ops = config.enable_vector_ops;
+        let mut loader = Self {
             config: Some(Box::new(config)),
             sparse_registry: FunctionRegistry::default(),
+        };
+        if enable_vector_ops {
+            // Never called, the engines run `call sol_avx512` themselves
+            loader
+                .register_definition::<crate::vector::DescriptorSyscall>(
+                    crate::vector::DESCRIPTOR_SYSCALL,
+                )
+                .unwrap();
         }
+        loader
     }
 
     /// Constructs a built-in program

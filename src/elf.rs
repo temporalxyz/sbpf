@@ -367,6 +367,13 @@ impl<C: ContextObject> Executable<C> {
         }
     }
 
+    /// Get the virtual address of [Self::get_ro_section]
+    pub fn get_ro_section_vm_addr(&self) -> u64 {
+        match &self.ro_section {
+            Section::Owned(offset, _) | Section::Borrowed(offset, _) => *offset as u64,
+        }
+    }
+
     /// Get a memory region that can be used to access the merged readonly section
     pub fn get_ro_region(&self) -> MemoryRegion {
         get_ro_region(&self.ro_section, self.elf_bytes.as_slice())
@@ -418,6 +425,8 @@ impl<C: ContextObject> Executable<C> {
                 self.get_text_bytes().1,
                 self.get_config(),
                 self.get_sbpf_version(),
+                self.get_ro_section_vm_addr(),
+                self.get_ro_section(),
             )?;
         }
         Ok(())
@@ -439,6 +448,29 @@ impl<C: ContextObject> Executable<C> {
     /// Get the function registry
     pub fn get_function_registry(&self) -> &FunctionRegistry<usize> {
         &self.function_registry
+    }
+
+    /// Create from raw text section bytes and a read-only section at [ebpf::MM_RODATA_START]
+    pub fn new_from_text_and_rodata_bytes(
+        text_bytes: &[u8],
+        rodata: &[u8],
+        loader: Arc<BuiltinProgram<C>>,
+        sbpf_version: SBPFVersion,
+        function_registry: FunctionRegistry<usize>,
+    ) -> Result<Self, ElfError> {
+        if !sbpf_version.enable_lower_rodata_vaddr() {
+            return Err(ElfError::UnsupportedSBPFVersion);
+        }
+        let mut executable =
+            Self::new_from_text_bytes(text_bytes, loader, sbpf_version, function_registry)?;
+        let mut bytes = text_bytes.to_vec();
+        bytes.extend_from_slice(rodata);
+        executable.elf_bytes = AlignedMemory::from_slice(&bytes);
+        executable.ro_section = Section::Borrowed(
+            ebpf::MM_RODATA_START as usize,
+            text_bytes.len()..bytes.len(),
+        );
+        Ok(executable)
     }
 
     /// Create from raw text section bytes (list of instructions)
