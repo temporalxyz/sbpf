@@ -142,9 +142,6 @@ pub struct Config {
     /// Enables the 512-bit vector ops (`CALL_IMM` with `src = 2`) for SBPF versions with
     /// static syscalls, see [crate::vector]
     pub enable_vector_ops: bool,
-    /// Charges a `lddw r1, imm` directly followed by `call sol_avx512` as part of the call, so the
-    /// pair costs the CUs of the vector op alone, see [crate::vector]
-    pub vector_pair_one_cu: bool,
 }
 
 impl Config {
@@ -173,7 +170,6 @@ impl Default for Config {
             enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
             aligned_region_size: ebpf::MM_REGION_SIZE as usize,
             enable_vector_ops: false,
-            vector_pair_one_cu: true,
         }
     }
 }

@@ -92,6 +92,8 @@ pub struct Interpreter<'a, 'b, 'c, C: ContextObject> {
 
     /// General purpose registers and pc
     pub reg: [u64; 12],
+    /// Whether the last instruction was the `lddw r1` of a pair, see [crate::vector::descriptor_pairs]
+    descriptor_load: bool,
 
     #[cfg(feature = "debugger")]
     pub(crate) debug_state: DebugState,
@@ -122,6 +124,7 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
             program_vm_addr,
             call_frames,
             reg: registers,
+            descriptor_load: false,
             #[cfg(feature = "debugger")]
             debug_state: DebugState::Continue,
             #[cfg(feature = "debugger")]
@@ -215,8 +218,9 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
 
         match insn.opc {
             ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
-                if crate::vector::is_free_descriptor_load(self.program, self.reg[11] as usize, config, self.executable.get_sbpf_version()) {
+                if crate::vector::is_descriptor_load(self.program, self.reg[11] as usize, config, self.executable.get_sbpf_version()) {
                     self.vm.due_insn_count -= 1;
+                    self.descriptor_load = true;
                 }
                 ebpf::augment_lddw_unchecked(self.program, &mut insn);
                 self.reg[dst] = insn.imm as u64;
@@ -570,6 +574,10 @@ impl<'a, 'b, 'c, C: ContextObject> Interpreter<'a, 'b, 'c, C> {
                 }
             }
             ebpf::CALL_IMM if crate::vector::is_descriptor_call(&insn, config.enable_vector_ops, self.executable.get_sbpf_version()) => {
+                // Entered other than through its `lddw r1`, like the second slot of a `lddw`
+                if !std::mem::take(&mut self.descriptor_load) {
+                    throw_error!(self, EbpfError::UnsupportedInstruction);
+                }
                 if let Err(err) = crate::vector::execute_descriptor(self.vm, &mut self.reg) {
                     throw_error!(self, err);
                 }

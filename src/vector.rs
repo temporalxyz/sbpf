@@ -784,15 +784,14 @@ pub fn is_descriptor_call(
         && insn.imm as u32 == descriptor_syscall_hash()
 }
 
-/// Whether the instruction at `pc` is a `lddw r1, imm` directly followed by `call sol_avx512`,
-/// which [Config::vector_pair_one_cu] charges as part of the call
-pub(crate) fn is_free_descriptor_load(
+/// Whether the instruction at `pc` is the `lddw r1, imm` of a pair, see [descriptor_pairs]
+pub(crate) fn is_descriptor_load(
     prog: &[u8],
     pc: usize,
     config: &Config,
     sbpf_version: SBPFVersion,
 ) -> bool {
-    if !config.vector_pair_one_cu || (pc + 3) * ebpf::INSN_SIZE > prog.len() {
+    if (pc + 3) * ebpf::INSN_SIZE > prog.len() {
         return false;
     }
     let load = ebpf::get_insn_unchecked(prog, pc);
@@ -806,78 +805,48 @@ pub(crate) fn is_free_descriptor_load(
         )
 }
 
-/// The vector op of each `call sol_avx512` whose `r1` is likely known at compile time, by pc,
-/// with the address of its descriptor
+/// The vector op of each `call sol_avx512`, by pc
 ///
-/// One pass in program order tracks the constants loaded by `lddw` and `mov64`, copied by `mov64`
-/// between registers and through 8 byte stack slots (spills), and ignores control flow, so this is
-/// only a guess. The JIT emits the op inline behind a runtime check of `r1` and calls the slow
-/// path otherwise.
-pub(crate) fn resolve_descriptor_calls(
+/// Every `call sol_avx512` must directly follow a `lddw r1, imm` whose `imm` is the address of a
+/// valid descriptor in the read-only section. The pair is one instruction: no jump or call may
+/// target the `call`, a `callx` onto it fails like one onto the second slot of a `lddw`, the pair
+/// costs the CUs of the op and leaves `r1` the descriptor address.
+pub(crate) fn descriptor_pairs(
     prog: &[u8],
     sbpf_version: SBPFVersion,
     ro_vm_addr: u64,
     ro: &[u8],
-) -> std::collections::HashMap<usize, (VectorInsn, u64)> {
-    let mut resolved = std::collections::HashMap::new();
-    let mut known = [None::<u64>; 11];
-    let mut stack = std::collections::HashMap::<i16, u64>::new();
+) -> Result<std::collections::HashMap<usize, VectorInsn>, (usize, &'static str)> {
+    let mut pairs = std::collections::HashMap::new();
+    let mut descriptor_load = None;
     let mut pc: usize = 0;
     while (pc + 1) * ebpf::INSN_SIZE <= prog.len() {
         let mut insn = ebpf::get_insn_unchecked(prog, pc);
-        let dst = (insn.dst as usize).min(10);
-        let class = insn.opc & ebpf::BPF_CLS_MASK;
         if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
             if (pc + 2) * ebpf::INSN_SIZE > prog.len() {
                 break;
             }
             ebpf::augment_lddw_unchecked(prog, &mut insn);
-            known[dst] = Some(insn.imm as u64);
+            descriptor_load = (insn.dst == 1).then_some(insn.imm as u64);
             pc += 2;
             continue;
         }
         if is_descriptor_call(&insn, true, sbpf_version) {
-            let descriptor = known[1]
-                .and_then(|addr| addr.checked_sub(ro_vm_addr).map(|start| (addr, start)))
-                .and_then(|(addr, start)| {
-                    let start = if start <= ro.len() as u64 {
-                        start as usize
-                    } else {
-                        return None;
-                    };
-                    let bytes = ro.get(start..start.checked_add(DESCRIPTOR_SIZE)?)?;
-                    let v =
-                        VectorInsn::from_descriptor(std::convert::TryInto::try_into(bytes).ok()?)
-                            .ok()?;
-                    Some((v, addr))
-                });
-            if let Some(descriptor) = descriptor {
-                resolved.insert(pc, descriptor);
-            }
-            known[0] = None;
-        } else if insn.opc == ebpf::MOV64_IMM {
-            known[dst] = Some(insn.imm as u64);
-        } else if insn.opc == ebpf::MOV64_REG {
-            known[dst] = known[(insn.src as usize).min(10)];
-        } else if insn.opc == ebpf::LD_DW_REG && insn.src == 10 {
-            known[dst] = stack.get(&insn.off).copied();
-        } else if matches!(class, ebpf::BPF_ST | ebpf::BPF_STX) && insn.dst == 10 {
-            stack.retain(|off, _| off.abs_diff(insn.off) >= 8);
-            if let (ebpf::ST_DW_REG, Some(value)) = (insn.opc, known[(insn.src as usize).min(10)]) {
-                stack.insert(insn.off, value);
-            }
-        } else if insn.opc == ebpf::CALL_IMM || insn.opc == ebpf::CALL_REG {
-            known[..6].fill(None);
-        } else if !matches!(
-            class,
-            ebpf::BPF_ST | ebpf::BPF_STX | ebpf::BPF_JMP64 | ebpf::BPF_JMP32
-        ) || sbpf_version.move_memory_instruction_classes()
-        {
-            known[dst] = None;
+            let addr =
+                descriptor_load.ok_or((pc, "call sol_avx512 must directly follow lddw r1"))?;
+            let bytes = addr
+                .checked_sub(ro_vm_addr)
+                .and_then(|start| <usize as std::convert::TryFrom<u64>>::try_from(start).ok())
+                .and_then(|start| ro.get(start..start.checked_add(DESCRIPTOR_SIZE)?))
+                .ok_or((pc, "descriptor outside of the read-only section"))?;
+            let v = VectorInsn::from_descriptor(std::convert::TryInto::try_into(bytes).unwrap())
+                .map_err(|reason| (pc, reason))?;
+            pairs.insert(pc, v);
         }
+        descriptor_load = None;
         pc += 1;
     }
-    resolved
+    Ok(pairs)
 }
 
 /// Checks that the host CPU has every feature the vector ops require (see SPEC.md).
@@ -1175,7 +1144,8 @@ pub(crate) fn verify(
     ro_vm_addr: u64,
     ro: &[u8],
 ) -> Result<(), VerifierError> {
-    let descriptor_calls = resolve_descriptor_calls(prog, sbpf_version, ro_vm_addr, ro);
+    let pairs = descriptor_pairs(prog, sbpf_version, ro_vm_addr, ro)
+        .map_err(|(pc, reason)| VerifierError::InvalidVectorOp(pc, reason))?;
     let mut machine_code_length = 0;
     let mut insn_ptr: usize = 0;
     while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
@@ -1195,10 +1165,7 @@ pub(crate) fn verify(
                     "call sol_avx512 must have dst and off 0",
                 ));
             } else {
-                DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
-                    + descriptor_calls
-                        .get(&insn_ptr)
-                        .map_or(0, |(v, _)| v.max_machine_code_length())
+                DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH + pairs[&insn_ptr].max_machine_code_length()
             };
             if !aligned_memory_mapping(config, sbpf_version) {
                 return Err(VerifierError::InvalidVectorOp(
@@ -1216,12 +1183,38 @@ pub(crate) fn verify(
         }
         insn_ptr += 1;
     }
+    // Nothing but the `lddw r1` may lead to the call of a pair
+    let mut insn_ptr: usize = 0;
+    while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
+        let insn = ebpf::get_insn(prog, insn_ptr);
+        let class = insn.opc & ebpf::BPF_CLS_MASK;
+        let target = if insn.opc == ebpf::CALL_IMM && insn.src == 1 {
+            Some((insn_ptr as i64).saturating_add(insn.imm).saturating_add(1))
+        } else if (class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32)
+            && !matches!(insn.opc, ebpf::CALL_IMM | ebpf::CALL_REG | ebpf::EXIT)
+        {
+            Some(insn_ptr as i64 + insn.off as i64 + 1)
+        } else {
+            None
+        };
+        if target.is_some_and(|target| pairs.contains_key(&(target as usize))) {
+            return Err(VerifierError::InvalidVectorOp(
+                insn_ptr,
+                "jump or call to the call of a pair",
+            ));
+        }
+        insn_ptr += if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
+            2
+        } else {
+            1
+        };
+    }
     Ok(())
 }
 
-/// Upper bound of the machine code length of the JIT for a `call sol_avx512` beyond the inline op:
-/// the check of `r1`, the call of the slow path and a free `lddw r1` before it
-pub const DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH: usize = 96;
+/// Upper bound of the machine code length of the JIT for the `lddw r1` of a pair, which is in the
+/// budget of the op since it may be inside a memory run
+pub const DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH: usize = 96;
 
 /// Set in [registers_used_by_program] if there is a vector op (some use no vector register)
 pub(crate) const PROGRAM_USES_VECTOR_OPS: u32 = 1 << 31;
@@ -1229,15 +1222,14 @@ pub(crate) const PROGRAM_USES_VECTOR_OPS: u32 = 1 << 31;
 /// Bit set of the vector registers used by any vector op in `prog` plus
 /// [PROGRAM_USES_VECTOR_OPS], 0 if there are none
 ///
-/// Of `call sol_avx512` only the ops in `descriptor_calls` count, the others run in the slow path,
-/// which works on [EbpfVm::vector_registers] only.
+/// Of `call sol_avx512` the ops in `pairs`, see [descriptor_pairs]
 pub(crate) fn registers_used_by_program(
     prog: &[u8],
     sbpf_version: SBPFVersion,
-    descriptor_calls: &std::collections::HashMap<usize, (VectorInsn, u64)>,
+    pairs: &std::collections::HashMap<usize, VectorInsn>,
 ) -> u32 {
     let mut mask = 0;
-    for (v, _) in descriptor_calls.values() {
+    for v in pairs.values() {
         mask |= v.registers_used() | PROGRAM_USES_VECTOR_OPS;
     }
     let mut insn_ptr: usize = 0;
@@ -1249,8 +1241,6 @@ pub(crate) fn registers_used_by_program(
             if let Ok(vector_insn) = VectorInsn::decode(&insn) {
                 mask |= vector_insn.registers_used() | PROGRAM_USES_VECTOR_OPS;
             }
-        } else if is_descriptor_call(&insn, true, sbpf_version) {
-            mask |= PROGRAM_USES_VECTOR_OPS;
         }
         insn_ptr += 1;
     }

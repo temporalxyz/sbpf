@@ -159,8 +159,7 @@ const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_VECTOR_PROLOGUE: usize = 33;
 const ANCHOR_VECTOR_TRANSLATE: usize = 34;
-const ANCHOR_VECTOR_DESCRIPTOR: usize = 48;
-const ANCHOR_COUNT: usize = 49; // Update me when adding or removing anchors
+const ANCHOR_COUNT: usize = 48; // Update me when adding or removing anchors
 
 /// Mapping of guest to host registers
 pub const REGISTER_MAP: [X86Register; 11] = [
@@ -300,13 +299,13 @@ pub struct JitCompiler<'a, C: ContextObject> {
     vector_registers_used: u32,
     /// See [vector_jit::MemoryRuns]
     vector_memory_runs: vector_jit::MemoryRuns,
-    /// See [crate::vector::resolve_descriptor_calls]
-    vector_descriptor_calls: std::collections::HashMap<usize, (crate::vector::VectorInsn, u64)>,
+    /// See [crate::vector::descriptor_pairs]
+    vector_descriptor_calls: std::collections::HashMap<usize, crate::vector::VectorInsn>,
+    /// See [vector_jit::PairSegment]
+    vector_pair_segment: Option<vector_jit::PairSegment>,
+    vector_pair_stubs: Vec<vector_jit::PairStub>,
     /// Host registers of the scalar input and the mask of the vector op being emitted
     vector_scalar_registers: [X86Register; 2],
-    /// Inline `call sol_avx512` whose slow path call is emitted after the program: text section
-    /// offset of the rel32 of the jump to it, pc and the offset to resume at
-    vector_descriptor_stubs: Vec<(usize, usize, usize)>,
 }
 
 #[rustfmt::skip]
@@ -338,7 +337,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             code_length_estimate += q * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
         let vector_descriptor_calls = if config.enable_vector_ops {
-            crate::vector::resolve_descriptor_calls(program, executable.get_sbpf_version(), executable.get_ro_section_vm_addr(), executable.get_ro_section())
+            crate::vector::descriptor_pairs(program, executable.get_sbpf_version(), executable.get_ro_section_vm_addr(), executable.get_ro_section()).unwrap_or_default()
         } else {
             Default::default()
         };
@@ -383,8 +382,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             vector_registers_used,
             vector_memory_runs: vector_jit::MemoryRuns::default(),
             vector_descriptor_calls,
+            vector_pair_segment: None,
+            vector_pair_stubs: Vec::new(),
             vector_scalar_registers: [REGISTER_MAP[1], REGISTER_MAP[2]],
-            vector_descriptor_stubs: Vec::new(),
         })
     }
 
@@ -405,6 +405,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 return Err(EbpfError::ExhaustedTextSegment(self.pc));
             }
             let mut insn = ebpf::get_insn_unchecked(self.program, self.pc);
+            self.emit_pair_segment_step();
             self.result.pc_section_mut()[self.pc] = self.offset_in_text_section as u32;
 
             // Regular instruction meter checkpoints to prevent long linear runs from exceeding their budget
@@ -427,9 +428,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::CALL_IMM if self.vector_registers_used != 0 && insn.src == crate::vector::VECTOR_OP_SRC => self.emit_vector_op(&insn)?,
                 ebpf::CALL_IMM if crate::vector::is_descriptor_call(&insn, self.config.enable_vector_ops, self.executable.get_sbpf_version()) => self.emit_descriptor_call()?,
                 ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
-                    // A load which vector_pair_one_cu charges as part of the call costs nothing
-                    // and checks the meter without REGISTER_SCRATCH, which may hold a memory run
-                    if crate::vector::is_free_descriptor_load(self.program, self.pc, self.config, self.executable.get_sbpf_version()) {
+                    // The load of a pair costs nothing and checks the meter without
+                    // REGISTER_SCRATCH, which may hold a memory run
+                    if self.in_pair_segment() {
+                        // Its meter and r1 are handled at the end of the segment
+                        self.pc += 1;
+                        self.result.pc_section_mut()[self.pc] = unsafe { self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION].offset_from(self.result.text_section().as_ptr()) as u32 };
+                        self.pc += 1;
+                        continue;
+                    }
+                    if crate::vector::is_descriptor_load(self.program, self.pc, self.config, self.executable.get_sbpf_version()) {
                         if self.config.enable_instruction_meter {
                             self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, REGISTER_INSTRUCTION_METER, self.pc as i64, None));
                             self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6)));
@@ -857,6 +865,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.pc += 1;
         }
 
+        self.emit_pair_segment_end();
         // Bumper in case there was no final exit
         if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section().len() {
             return Err(EbpfError::ExhaustedTextSegment(self.pc));
@@ -865,9 +874,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64)); // Save pc
         self.emit_set_exception_kind(EbpfError::ExecutionOverrun);
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
-        self.emit_descriptor_stubs()?;
 
+        self.emit_pair_stubs()?;
         self.resolve_jumps();
+        // Debug hook: native text, pc section and bytecode of the program to $SBPF_JIT_DUMP.*
+        if let Ok(path) = std::env::var("SBPF_JIT_DUMP") {
+            let pcs: Vec<u8> = self.result.pc_section().iter().flat_map(|offset| offset.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{path}.text"), &self.result.text_section()[..self.offset_in_text_section]);
+            let _ = std::fs::write(format!("{path}.pcs"), pcs);
+            let _ = std::fs::write(format!("{path}.bpf"), self.program);
+        }
         if self.vector_registers_used != 0 {
             self.result.set_entry_prologue(self.anchors[ANCHOR_VECTOR_PROLOGUE] as usize - self.result.text_section().as_ptr() as usize);
         }

@@ -28,7 +28,7 @@ use crate::{
     memory_region::{jit_region_layout, AccessType, JitRegionTable},
     vector::{
         self, encode_masked, gather_scatter_shape, op, Kind, Mask, VectorInsn,
-        DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH, VECTOR_OP_SRC, VECTOR_REGISTERS, VECTOR_SIZE,
+        DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH, VECTOR_OP_SRC, VECTOR_REGISTERS, VECTOR_SIZE,
     },
     vm::EncryptedHostAddressToEbpfVm,
     x86_evex::{
@@ -111,56 +111,33 @@ extern "C" fn vector_slow_path<C: ContextObject>(
     }
 }
 
-/// First half of the slow path of `call sol_avx512`: reads and decodes the descriptor at `r1`.
-/// Writes the `src = 2` encoding of the op (or the error) to [EbpfVm::program_result] and returns
-/// the CUs of the op.
-extern "C" fn descriptor_slow_path_decode<C: ContextObject>(
-    mut vm: EncryptedHostAddressToEbpfVm<C>,
-    r1: u64,
-) -> u64 {
-    #[cfg(test)]
-    SLOW_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
-    // SAFETY: called from the JIT code of this VM, which holds no other reference to it
-    unsafe {
-        vm.with_vm(|vm| match vector::read_descriptor(vm, r1) {
-            Ok(v) => {
-                vm.program_result = ProgramResult::Ok(v.encode());
-                v.info.cu(v.imm8)
-            }
-            Err(err) => {
-                vm.program_result = ProgramResult::Err(err);
-                0
-            }
-        })
-    }
+/// Pair segments: consecutive pairs (see [vector::descriptor_pairs]) whose ops cannot fail (they
+/// neither access memory nor cost more than 1 CU) except maybe the last, with no jump target after
+/// the first and no instruction meter checkpoint inside.
+///
+/// Each pair spans 3 slots and costs 1 CU. Instead of refunding 2 and checking the meter at every
+/// `lddw r1`, the end of a segment of `len` pairs from `start` checks once and refunds `2 * len`:
+/// after its last op, or before it if that one can fail. If the meter ran out inside, the out of
+/// line [PairStub::Exceeded] computes the pc the interpreter stops at. `r1` is only set at the
+/// end, to the descriptor of the last pair (the ops before cannot observe it), and not at all if
+/// the instruction after the segment overwrites it. Entering at
+/// the `lddw r1` of pair `j > 0` by `callx` goes through a [PairStub::Entry], which takes back the
+/// `2 * j` the end refunds for the pairs before it.
+#[derive(Clone, Copy)]
+pub(super) struct PairSegment {
+    start: usize,
+    len: usize,
+    descriptor: u64,
+    /// Whether the op of the last pair can fail, so the segment ends before it
+    closing: bool,
 }
 
-/// Second half of the slow path of `call sol_avx512`: executes the op like the interpreter
-/// (without CUs), writes the result to [EbpfVm::program_result] and returns the new `r0`
-extern "C" fn descriptor_slow_path_execute<C: ContextObject>(
-    mut vm: EncryptedHostAddressToEbpfVm<C>,
-    r2: u64,
-    r3: u64,
-    word: u64,
-    r0: u64,
-) -> u64 {
-    // SAFETY: called from the JIT code of this VM, which holds no other reference to it
-    unsafe {
-        vm.with_vm(|vm| {
-            let insn = ebpf::get_insn(&word.to_le_bytes(), 0);
-            let v = VectorInsn::decode(&insn).unwrap();
-            match vector::execute_decoded(vm, &v, r2, r3) {
-                Ok(result) => {
-                    vm.program_result = ProgramResult::Ok(0);
-                    result.unwrap_or(r0)
-                }
-                Err(err) => {
-                    vm.program_result = ProgramResult::Err(err);
-                    r0
-                }
-            }
-        })
-    }
+/// Out of line code of [PairSegment]s, emitted after the program
+pub(super) enum PairStub {
+    /// The meter ran out in the segment from `start`: text section offset of the rel32 to patch
+    Exceeded { jump: usize, start: usize },
+    /// `callx` entry of the pair at `pc`, charging `charge`
+    Entry { pc: usize, charge: i64 },
 }
 
 /// Memory runs: consecutive vector ops (nothing else in between, so `r1` is unchanged and no host
@@ -188,6 +165,9 @@ pub(super) struct MemoryRuns {
     budget_start: usize,
     /// Sum of [max_machine_code_length] of these ops
     budget: usize,
+    /// pc of the call of a pair whose [PairSegment] ended right before its op, which checked the
+    /// meter exactly like the access of the op would
+    meter_checked: Option<usize>,
 }
 
 /// See [MemoryRuns]
@@ -1267,7 +1247,7 @@ pub(super) fn machine_code_length_estimate(
     prog: &[u8],
     sbpf_version: crate::program::SBPFVersion,
     registers_used: u32,
-    descriptor_calls: &std::collections::HashMap<usize, (VectorInsn, u64)>,
+    pairs: &std::collections::HashMap<usize, VectorInsn>,
 ) -> usize {
     let mut length = 0;
     let mut insn_ptr: usize = 0;
@@ -1279,11 +1259,9 @@ pub(super) fn machine_code_length_estimate(
             if let Ok(v) = VectorInsn::decode(&insn) {
                 length += max_machine_code_length(&v, registers_used);
             }
-        } else if vector::is_descriptor_call(&insn, true, sbpf_version) {
-            length += DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH;
-            if let Some((v, _)) = descriptor_calls.get(&insn_ptr) {
-                length += max_machine_code_length(v, registers_used);
-            }
+        } else if let Some(v) = pairs.get(&insn_ptr) {
+            length += DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH
+                + max_machine_code_length(v, registers_used);
         }
         insn_ptr += 1;
     }
@@ -1349,105 +1327,28 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         self.emit_vector_insn(vector_insn, 0)
     }
 
-    /// `call sol_avx512`: if [vector::resolve_descriptor_calls] found the op, it is emitted inline
-    /// behind a check that `r1` is the address of its descriptor. Otherwise, or if `r1` differs
-    /// (out of line), the slow path subroutine reads the descriptor at `r1`.
+    /// The call of a pair (see [vector::descriptor_pairs]): its op, with the scalar input in `r2`
+    /// and the mask in `r3`. Only reachable from the `lddw r1` of the pair.
     pub(super) fn emit_descriptor_call(&mut self) -> Result<(), EbpfError> {
         let pc = self.pc;
-        if let Some(&(v, addr)) = self.descriptor_call(pc) {
-            self.emit_descriptor_guard(addr);
-            let slow_path = self.offset_in_text_section + 2;
-            self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne slow path
+        if let Some(&v) = self.vector_descriptor_calls.get(&pc) {
             self.vector_scalar_registers = DESCRIPTOR_SCALAR_REGISTERS;
-            let result = self.emit_vector_insn(v, DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH);
+            let result = self.emit_vector_insn(v, DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH);
             self.vector_scalar_registers = SCALAR_REGISTERS;
             result?;
-            self.vector_descriptor_stubs
-                .push((slow_path, pc, self.offset_in_text_section));
-            return Ok(());
-        }
-        if self.offset_in_text_section + DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
-            >= self.result.text_section().len()
-        {
-            return Err(EbpfError::ExhaustedTextSegment(pc));
-        }
-        self.emit_descriptor_slow_path_call(pc);
-        Ok(())
-    }
-
-    /// Calls the slow path subroutine of the `call sol_avx512` at `pc`
-    fn emit_descriptor_slow_path_call(&mut self, pc: usize) {
-        self.emit_ins(X86Instruction::store_immediate(
-            OperandSize::S64,
-            RSP,
-            X86IndirectAccess::OffsetIndexShift(-16, RSP, 0),
-            pc as i64,
-        ));
-        self.emit_ins(X86Instruction::call_immediate(
-            self.relative_to_anchor(ANCHOR_VECTOR_DESCRIPTOR, 5),
-        ));
-    }
-
-    /// The slow path calls of the inline `call sol_avx512`, out of line after the program
-    pub(super) fn emit_descriptor_stubs(&mut self) -> Result<(), EbpfError> {
-        for (jump, pc, resume) in std::mem::take(&mut self.vector_descriptor_stubs) {
-            if self.offset_in_text_section + DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH
-                >= self.result.text_section().len()
-            {
-                return Err(EbpfError::ExhaustedTextSegment(pc));
-            }
-            self.patch_rel32(jump);
-            self.emit_descriptor_slow_path_call(pc);
-            self.emit_ins(X86Instruction::jump_immediate(
-                self.relative_to_offset(resume, 5),
-            ));
-        }
-        Ok(())
-    }
-
-    /// The op and descriptor address of the `call sol_avx512` at `pc` if it is emitted inline
-    fn descriptor_call(&self, pc: usize) -> Option<&(VectorInsn, u64)> {
-        // emit_descriptor_guard needs the address in 30 bits
-        self.vector_descriptor_calls
-            .get(&pc)
-            .filter(|(_, addr)| *addr < 1 << 30)
-    }
-
-    /// Sets ZF if `r1` is `addr`, without REGISTER_SCRATCH (which may hold a memory run) and
-    /// without user provided immediates if they are sanitized
-    fn emit_descriptor_guard(&mut self, addr: u64) {
-        if self.should_sanitize_constant(addr as i64) {
-            let key = (self.immediate_value_key as i32 >> 1) as i64;
-            let blinded = addr as i64 - key;
-            self.emit_ins(X86Instruction::alu_immediate(
-                OperandSize::S64,
-                0x81,
-                5,
-                REGISTER_MAP[1],
-                blinded,
-                None,
-            ));
-            self.emit_ins(X86Instruction::cmp_immediate(
-                OperandSize::S64,
-                REGISTER_MAP[1],
-                key,
-                None,
-            ));
-            // lea keeps the flags
-            self.emit_ins(X86Instruction::lea(
-                OperandSize::S64,
-                REGISTER_MAP[1],
-                REGISTER_MAP[1],
-                Some(X86IndirectAccess::Offset(blinded as i32)),
-            ));
         } else {
-            self.emit_ins(X86Instruction::cmp_immediate(
-                OperandSize::S64,
-                REGISTER_MAP[1],
-                addr as i64,
-                None,
+            // Only reachable if the program was not verified
+            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, pc as i64));
+            self.emit_ins(X86Instruction::jump_immediate(
+                self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5),
             ));
         }
+        let unsupported_offset = unsafe {
+            self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION]
+                .offset_from(self.result.text_section().as_ptr()) as u32
+        };
+        self.result.pc_section_mut()[pc] = unsupported_offset;
+        Ok(())
     }
 
     /// Emits a decoded vector op, `extra_budget` is machine code emitted around it
@@ -1939,7 +1840,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         } else {
             usize::MAX
         };
-        let descriptor = self.descriptor_call(self.pc).is_some();
+        let descriptor = self.vector_descriptor_calls.contains_key(&self.pc);
         let (mut end, mut accesses, mut stores) = (self.pc, 0, false);
         let mut worst_case_length = 0;
         let (mut min_off, mut max_end) = (i64::MAX, i64::MIN);
@@ -1948,23 +1849,19 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             && (pc == self.pc || (pc < limit && !self.vector_memory_runs.jump_targets[pc]))
         {
             let insn = ebpf::get_insn_unchecked(self.program, pc);
-            // A run is either all `src = 2` ops or all inline `call sol_avx512`, which may be
-            // preceded by a free `lddw r1` (which leaves `r2`, their scalar input, unchanged)
+            // A run is either all `src = 2` ops or all pairs, whose `lddw r1` leaves `r2`, their
+            // scalar input, unchanged
             let vector_insn = if descriptor {
-                if vector::is_free_descriptor_load(
-                    self.program,
-                    pc,
-                    self.config,
-                    self.executable.get_sbpf_version(),
-                ) && self.descriptor_call(pc + 2).is_some()
+                if self.vector_descriptor_calls.contains_key(&(pc + 2))
+                    && insn.opc == ebpf::LD_DW_IMM
                 {
                     pc += 2;
                     continue;
                 }
-                let Some((vector_insn, _)) = self.descriptor_call(pc) else {
+                let Some(vector_insn) = self.vector_descriptor_calls.get(&pc) else {
                     break;
                 };
-                worst_case_length += DESCRIPTOR_CALL_MAX_MACHINE_CODE_LENGTH;
+                worst_case_length += DESCRIPTOR_LOAD_MAX_MACHINE_CODE_LENGTH;
                 *vector_insn
             } else {
                 if insn.opc != ebpf::CALL_IMM || insn.src != VECTOR_OP_SRC {
@@ -2017,7 +1914,9 @@ impl<C: ContextObject> JitCompiler<'_, C> {
     /// Emits a memory access of the current [MemoryRun]
     fn emit_memory_run_access(&mut self, insn: VectorInsn, lowering: &Lowering) {
         // Like the translation subroutines, never access memory beyond the instruction meter limit
-        if self.config.enable_instruction_meter {
+        if self.config.enable_instruction_meter
+            && self.vector_memory_runs.meter_checked != Some(self.pc)
+        {
             self.emit_ins(X86Instruction::cmp_immediate(
                 OperandSize::S64,
                 REGISTER_INSTRUCTION_METER,
@@ -2070,8 +1969,16 @@ impl<C: ContextObject> JitCompiler<'_, C> {
                 self.relative_to_offset(fallback.resume, 5),
             ));
         }
+        let unsupported = unsafe {
+            self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION]
+                .offset_from(self.result.text_section().as_ptr()) as usize
+        };
         for pc in run.start + 1..=run.end {
             let code = self.result.pc_section()[pc] as usize;
+            // The second slot of a lddw or the call of a pair
+            if code == unsupported {
+                continue;
+            }
             self.result.pc_section_mut()[pc] = self.offset_in_text_section as u32;
             self.emit_ins(X86Instruction::alu(
                 OperandSize::S32,
@@ -2087,179 +1994,208 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         self.patch_rel32(skip);
     }
 
-    /// Slow path subroutine of `call sol_avx512`
-    ///
-    /// Input: guest pc in X86IndirectAccess::OffsetIndexShift(-8, RSP, 0). Runs the op of the
-    /// descriptor at `r1` like the interpreter, or throws its error.
-    fn emit_descriptor_slow_path(&mut self) {
-        self.set_anchor(ANCHOR_VECTOR_DESCRIPTOR);
-        // The pc slot and padding: emit_rust_call with a result register pushes one register less
-        // than the translation subroutines, which keeps the stack aligned
-        let pc_on_stack = X86IndirectAccess::OffsetIndexShift(8, RSP, 0);
-        self.emit_ins(X86Instruction::alu_immediate(
-            OperandSize::S64,
-            0x81,
-            5,
-            RSP,
-            16,
-            None,
-        ));
-        self.emit_rust_call(
-            Value::Constant64(descriptor_slow_path_decode::<C> as *const u8 as i64, false),
-            &[
-                Argument {
-                    index: 1,
-                    value: Value::Register(REGISTER_MAP[1]),
-                },
-                Argument {
-                    index: 0,
-                    value: Value::Register(REGISTER_PTR_TO_VM),
-                },
-            ],
-            Some(REGISTER_SCRATCH),
-        );
-        self.emit_check_result_is_ok();
-        let mut errors = vec![self.offset_in_text_section + 2];
-        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne error
+    /// Descriptor address of the pair whose `lddw r1` is at `pc` and whether its op can fail
+    fn segment_pair(&self, pc: usize) -> Option<(u64, bool)> {
+        let v = self.vector_descriptor_calls.get(&(pc + 2))?;
+        let can_fail = memory_access(v).is_some()
+            || matches!(v.info.kind, Kind::Ga | Kind::Sc)
+            || v.info.cu(v.imm8) > 1;
+        let mut insn = ebpf::get_insn_unchecked(self.program, pc);
+        if insn.opc != ebpf::LD_DW_IMM || insn.dst != 1 {
+            return None;
+        }
+        ebpf::augment_lddw_unchecked(self.program, &mut insn);
+        Some((insn.imm as u64, can_fail))
+    }
+
+    /// Called before every instruction: extends the [PairSegment] by the pair at self.pc, or ends
+    /// it and starts a new one there
+    pub(super) fn emit_pair_segment_step(&mut self) {
+        // The tracer records r1 and the meter at every instruction
+        if cfg!(feature = "tracer") || self.vector_descriptor_calls.is_empty() {
+            return;
+        }
+        let pc = self.pc;
+        if let Some(segment) = self.vector_pair_segment {
+            if pc == segment.start + 3 * segment.len - 1 {
+                // The call of its last pair
+                if segment.closing {
+                    self.emit_pair_segment_end();
+                }
+                return;
+            }
+        }
+        let pair = self.segment_pair(pc);
+        if let Some(segment) = self.vector_pair_segment {
+            if self.vector_memory_runs.jump_targets.is_empty() {
+                self.vector_memory_runs.jump_targets = self.find_jump_targets();
+            }
+            let checkpoint = self.config.enable_instruction_meter
+                && self.last_instruction_meter_validation_pc
+                    + self.config.instruction_meter_checkpoint_distance
+                    <= pc;
+            if let Some((descriptor, closing)) = pair.filter(|_| {
+                pc == segment.start + 3 * segment.len
+                    && !checkpoint
+                    && !self.vector_memory_runs.jump_targets[pc]
+            }) {
+                self.vector_pair_segment = Some(PairSegment {
+                    len: segment.len + 1,
+                    descriptor,
+                    closing,
+                    ..segment
+                });
+                return;
+            }
+            self.emit_pair_segment_end();
+        }
+        self.vector_pair_segment = pair.map(|(descriptor, closing)| PairSegment {
+            start: pc,
+            len: 1,
+            descriptor,
+            closing,
+        });
+    }
+
+    /// Whether the `lddw r1` at self.pc is in a [PairSegment], so it emits nothing
+    pub(super) fn in_pair_segment(&self) -> bool {
+        self.vector_pair_segment
+            .is_some_and(|segment| segment.start + 3 * (segment.len - 1) == self.pc)
+    }
+
+    /// End of a [PairSegment]: checks and refunds the meter, sets `r1`
+    pub(super) fn emit_pair_segment_end(&mut self) {
+        let Some(PairSegment {
+            start,
+            len,
+            descriptor,
+            closing,
+        }) = self.vector_pair_segment.take()
+        else {
+            return;
+        };
         if self.config.enable_instruction_meter {
-            // REGISTER_SCRATCH = cu: as emit_vector_cu_check
             self.emit_ins(X86Instruction::cmp_immediate(
                 OperandSize::S64,
-                REGISTER_SCRATCH,
-                1,
-                None,
-            ));
-            let single = self.offset_in_text_section + 2;
-            self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, 0)); // jbe single
-            self.emit_ins(X86Instruction::alu_immediate(
-                OperandSize::S64,
-                0x81,
-                5,
-                REGISTER_SCRATCH,
-                1,
-                None,
-            ));
-            self.emit_ins(X86Instruction::alu(
-                OperandSize::S64,
-                0x03,
-                REGISTER_SCRATCH,
-                RSP,
-                Some(pc_on_stack),
-            )); // REGISTER_SCRATCH = pc + cu - 1
-            self.emit_ins(X86Instruction::cmp(
-                OperandSize::S64,
-                REGISTER_SCRATCH,
                 REGISTER_INSTRUCTION_METER,
+                (start + len - 1) as i64,
                 None,
             ));
-            let covered = self.offset_in_text_section + 2;
-            self.emit_ins(X86Instruction::conditional_jump_immediate(0x87, 0)); // ja covered
-            self.emit_ins(X86Instruction::load(
+            let jump = self.offset_in_text_section + 2;
+            self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, 0)); // jbe exceeded
+            self.vector_pair_stubs
+                .push(PairStub::Exceeded { jump, start });
+            self.emit_sanitized_alu(
                 OperandSize::S64,
-                RSP,
-                REGISTER_SCRATCH,
-                pc_on_stack,
-            ));
-            self.emit_ins(X86Instruction::cmp(
-                OperandSize::S64,
-                REGISTER_SCRATCH,
+                0x01,
+                0,
                 REGISTER_INSTRUCTION_METER,
-                None,
-            ));
-            // Ran out before this op: the meter already holds the pc to report
-            self.emit_ins(X86Instruction::conditional_jump_immediate(
-                0x86,
-                self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6),
-            ));
-            self.emit_ins(X86Instruction::mov(
-                OperandSize::S64,
-                REGISTER_SCRATCH,
-                REGISTER_INSTRUCTION_METER,
-            ));
-            self.emit_ins(X86Instruction::jump_immediate(
-                self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 5),
-            ));
-            self.patch_rel32(covered);
-            self.emit_ins(X86Instruction::alu(
-                OperandSize::S64,
-                0x2B,
-                REGISTER_SCRATCH,
-                RSP,
-                Some(pc_on_stack),
-            )); // REGISTER_SCRATCH = cu - 1
-            self.emit_ins(X86Instruction::alu(
-                OperandSize::S64,
-                0x29,
-                REGISTER_SCRATCH,
-                REGISTER_INSTRUCTION_METER,
-                None,
-            ));
-            self.patch_rel32(single);
+                2 * len as i64,
+            );
+            // Before the op of the last pair (at its call): the check is r10 + 2 * len <= its pc
+            if closing && self.pc == start + 3 * len - 1 {
+                self.vector_memory_runs.meter_checked = Some(self.pc);
+            }
+            for j in 1..len {
+                self.vector_pair_stubs.push(PairStub::Entry {
+                    pc: start + 3 * j,
+                    charge: 2 * j as i64,
+                });
+            }
         }
-        self.emit_rust_call(
-            Value::Constant64(descriptor_slow_path_execute::<C> as *const u8 as i64, false),
-            &[
-                // In this order, the scalar registers are the next argument registers
-                Argument {
-                    index: 1,
-                    value: Value::Register(REGISTER_MAP[2]),
-                },
-                Argument {
-                    index: 2,
-                    value: Value::Register(REGISTER_MAP[3]),
-                },
-                Argument {
-                    index: 3,
-                    value: Value::RegisterIndirect(
-                        REGISTER_PTR_TO_VM,
-                        self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult)
-                            + std::mem::size_of::<u64>() as i32,
-                        false,
-                    ),
-                },
-                Argument {
-                    index: 4,
-                    value: Value::Register(REGISTER_MAP[0]),
-                },
-                Argument {
-                    index: 0,
-                    value: Value::Register(REGISTER_PTR_TO_VM),
-                },
-            ],
-            Some(REGISTER_MAP[0]),
-        );
-        self.emit_check_result_is_ok();
-        errors.push(self.offset_in_text_section + 2);
-        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, 0)); // jne error
-        self.emit_ins(X86Instruction::alu_immediate(
-            OperandSize::S64,
-            0x81,
-            0,
-            RSP,
-            16,
-            None,
-        ));
-        // Inside a memory run the following accesses take their fallbacks
-        self.emit_ins(X86Instruction::alu(
-            OperandSize::S32,
-            0x31,
-            REGISTER_SCRATCH,
-            REGISTER_SCRATCH,
-            None,
-        ));
-        self.emit_ins(X86Instruction::return_near());
-        for error in errors {
-            self.patch_rel32(error);
+        if self.r1_dead_at(start + 3 * len) {
+            return;
         }
-        self.emit_ins(X86Instruction::load(
-            OperandSize::S64,
-            RSP,
-            REGISTER_SCRATCH,
-            pc_on_stack,
-        )); // REGISTER_SCRATCH = pc
-        self.emit_ins(X86Instruction::jump_immediate(
-            self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5),
-        ));
+        if self.should_sanitize_constant(descriptor as i64) {
+            self.emit_sanitized_load_immediate(REGISTER_MAP[1], descriptor as i64);
+        } else {
+            self.emit_ins(X86Instruction::load_immediate(
+                REGISTER_MAP[1],
+                descriptor as i64,
+            ));
+        }
+    }
+
+    /// Whether the straight line from `pc` overwrites `r1` before anything could read it. A failing
+    /// instruction or op ends the program, which makes r1 dead there too.
+    fn r1_dead_at(&self, mut pc: usize) -> bool {
+        for _ in 0..16 {
+            if (pc + 1) * ebpf::INSN_SIZE > self.program.len() {
+                return false;
+            }
+            let insn = ebpf::get_insn_unchecked(self.program, pc);
+            let class = insn.opc & ebpf::BPF_CLS_MASK;
+            if insn.dst == 1 {
+                // Only plain writes, the other instructions with dst r1 also read it
+                return matches!(
+                    insn.opc,
+                    ebpf::LD_DW_IMM | ebpf::MOV64_IMM | ebpf::MOV32_IMM
+                ) || matches!(insn.opc, ebpf::MOV64_REG | ebpf::MOV32_REG) && insn.src != 1;
+            }
+            // Calls (also of vector ops, which read r1) and jumps leave the straight line
+            if insn.src == 1 || class == ebpf::BPF_JMP64 || class == ebpf::BPF_JMP32 {
+                return false;
+            }
+            pc += if insn.opc == ebpf::LD_DW_IMM { 2 } else { 1 };
+        }
+        false
+    }
+
+    /// The [PairStub]s, after the program
+    pub(super) fn emit_pair_stubs(&mut self) -> Result<(), EbpfError> {
+        for stub in std::mem::take(&mut self.vector_pair_stubs) {
+            if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION
+                >= self.result.text_section().len()
+            {
+                return Err(EbpfError::ExhaustedTextSegment(self.pc));
+            }
+            match stub {
+                PairStub::Exceeded { jump, start } => {
+                    // The meter m ran out at the pair i = max(0, m - start), which sees the
+                    // refunds of the i pairs before it: report pc m + 2 * i
+                    self.patch_rel32(jump);
+                    self.emit_ins(X86Instruction::cmp_immediate(
+                        OperandSize::S64,
+                        REGISTER_INSTRUCTION_METER,
+                        start as i64,
+                        None,
+                    ));
+                    self.emit_ins(X86Instruction::conditional_jump_immediate(
+                        0x86,
+                        self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6),
+                    ));
+                    self.emit_ins(X86Instruction::lea(
+                        OperandSize::S64,
+                        REGISTER_INSTRUCTION_METER,
+                        REGISTER_INSTRUCTION_METER,
+                        Some(X86IndirectAccess::OffsetIndexShift(
+                            -2 * start as i32,
+                            REGISTER_INSTRUCTION_METER,
+                            1,
+                        )),
+                    ));
+                    self.emit_ins(X86Instruction::jump_immediate(
+                        self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 5),
+                    ));
+                }
+                PairStub::Entry { pc, charge } => {
+                    let code = self.result.pc_section()[pc] as usize;
+                    self.result.pc_section_mut()[pc] = self.offset_in_text_section as u32;
+                    self.emit_ins(X86Instruction::alu_immediate(
+                        OperandSize::S64,
+                        0x81,
+                        5,
+                        REGISTER_INSTRUCTION_METER,
+                        charge,
+                        None,
+                    ));
+                    self.emit_ins(X86Instruction::jump_immediate(
+                        self.relative_to_offset(code, 5),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Points the rel32 at `location` to the current offset
@@ -2423,8 +2359,6 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         let jump_offset =
             self.relative_to_target_pc(self.executable.get_entrypoint_instruction_offset(), 5);
         self.emit_ins(X86Instruction::jump_immediate(jump_offset));
-
-        self.emit_descriptor_slow_path();
 
         // Translation subroutines
         // Input: vm address in REGISTER_SCRATCH, guest pc in X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)
