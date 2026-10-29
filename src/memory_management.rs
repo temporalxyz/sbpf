@@ -148,6 +148,9 @@ impl BucketedFreeList {
 
     /// Allocate memory of at least the given size, which returns to the pool when dropped.
     fn alloc(&self, size: usize) -> Pages {
+        if size > BUCKET_MAX {
+            return Pages::new(size).expect("allocation failed");
+        }
         self.buckets[Self::bucket_idx(size)].alloc()
     }
 
@@ -716,5 +719,15 @@ mod tests {
             drop(tail);
             assert_eq!(*head, [0xcc]);
         }
+    }
+
+    /// Larger sizes than the biggest bucket are mapped without the pool.
+    #[test]
+    fn pooled_mapping_above_bucket_max() {
+        let len = BUCKET_MAX + get_system_page_size();
+        let mut mapping = Mapping::pooled(len);
+        assert_eq!(mapping.len(), len);
+        mapping[len - 1] = 0xcc;
+        assert_eq!(mapping[len - 1], 0xcc);
     }
 }

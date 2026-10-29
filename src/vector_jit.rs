@@ -59,35 +59,6 @@ const K3: u8 = 3;
 /// translation subroutines use)
 const GATHER_SCATTER_SAVED_REGISTERS: [(X86Register, i32); 2] = [(RAX, -48), (RCX, -56)];
 
-/// Returns the name of a host CPU feature the lowering needs but is missing
-pub(super) fn missing_host_feature() -> Option<&'static str> {
-    [
-        (is_x86_feature_detected!("avx512f"), "avx512f"),
-        (is_x86_feature_detected!("avx512bw"), "avx512bw"),
-        (is_x86_feature_detected!("avx512dq"), "avx512dq"),
-        (is_x86_feature_detected!("avx512vl"), "avx512vl"),
-        (is_x86_feature_detected!("avx512vnni"), "avx512vnni"),
-        (is_x86_feature_detected!("avx512ifma"), "avx512ifma"),
-        (is_x86_feature_detected!("avx512bitalg"), "avx512bitalg"),
-        (
-            is_x86_feature_detected!("avx512vpopcntdq"),
-            "avx512vpopcntdq",
-        ),
-        (is_x86_feature_detected!("vpclmulqdq"), "vpclmulqdq"),
-        (is_x86_feature_detected!("avx512cd"), "avx512cd"),
-        (is_x86_feature_detected!("avx512vbmi"), "avx512vbmi"),
-        (is_x86_feature_detected!("avx512vbmi2"), "avx512vbmi2"),
-        (is_x86_feature_detected!("gfni"), "gfni"),
-        (is_x86_feature_detected!("vaes"), "vaes"),
-        (is_x86_feature_detected!("sha"), "sha"),
-        (is_x86_feature_detected!("popcnt"), "popcnt"),
-        (is_x86_feature_detected!("bmi1"), "bmi1"),
-        (is_x86_feature_detected!("lzcnt"), "lzcnt"),
-    ]
-    .iter()
-    .find_map(|&(detected, name)| (!detected).then_some(name))
-}
-
 /// Returns the anchor of the translation subroutine for the given access
 fn translation_anchor(access_type: AccessType, len: u64) -> usize {
     let index = TRANSLATION_LENGTHS.iter().position(|l| *l == len).unwrap();
@@ -203,6 +174,33 @@ pub(crate) enum HostInstruction {
 }
 
 impl HostInstruction {
+    /// Machine code length, including the `cld` of [JitCompiler::emit_host_instruction]
+    fn length(&self) -> usize {
+        let length = match self {
+            Self::Evex(instruction) => instruction.encode().1,
+            Self::KmovqToGpr(..) | Self::KmovqFromGpr(..) => 5,
+            Self::Legacy(instruction) => instruction.encode().1,
+        };
+        length + self.ends_in_0xff() as usize
+    }
+
+    /// Whether the last byte is a ModRM or imm8 of 0xff (not a displacement)
+    fn ends_in_0xff(&self) -> bool {
+        match self {
+            Self::Evex(instruction) => {
+                let (bytes, len) = instruction.encode();
+                (instruction.imm8.is_some() || matches!(instruction.rm, Rm::Reg(_)))
+                    && bytes[len - 1] == 0xff
+            }
+            Self::KmovqToGpr(destination, mask) => kmovq_to_gpr(*destination, *mask)[4] == 0xff,
+            Self::KmovqFromGpr(mask, source) => kmovq_from_gpr(*mask, *source)[4] == 0xff,
+            Self::Legacy(instruction) => {
+                let (bytes, len) = instruction.encode();
+                bytes[len - 1] == 0xff
+            }
+        }
+    }
+
     /// Machine code bytes
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -783,6 +781,70 @@ fn memory_access(v: &VectorInsn) -> Option<(AccessType, u64)> {
     })
 }
 
+/// [lower] for the JIT with sanitized user values: no instruction encodes ModRM 0xff (both
+/// register fields are 7 mod 8, which the user can choose) followed by an imm8 (which the user
+/// can choose too). Those two bytes decode as a `jmp` or `call` to a guest register. The source
+/// in such a ModRM field is moved to zmm30 first.
+fn lower_sanitized(v: &VectorInsn) -> Lowering {
+    use HostInstruction::Evex;
+    let lowering = lower(v);
+    let uses_zmm30 = lowering.instructions.iter().any(|instruction| {
+        matches!(instruction, Evex(evex)
+            if evex.reg == ZMM30 || evex.vvvv == ZMM30 || evex.rm == Rm::Reg(ZMM30))
+    });
+    if uses_zmm30 {
+        return lowering;
+    }
+    let mut instructions = Vec::with_capacity(lowering.instructions.len() + 1);
+    for instruction in lowering.instructions {
+        if let Evex(mut evex) = instruction {
+            if let (Some(_), Rm::Reg(rm)) = (evex.imm8, evex.rm) {
+                if evex.reg & 7 == 7 && rm & 7 == 7 {
+                    // vextracti32x4 and vextracti64x4 read ModRM.reg, the others ModRM.rm
+                    let extract = evex.map == M0F3A && matches!(evex.opcode, 0x39 | 0x3b);
+                    let source = if extract { evex.reg } else { rm };
+                    instructions.push(Evex(EvexInstruction::rr(
+                        P66, M0F, true, 0x6f, ZMM30, source,
+                    ))); // vmovdqa64
+                    if extract {
+                        evex.reg = ZMM30;
+                    } else {
+                        evex.rm = Rm::Reg(ZMM30);
+                    }
+                }
+            }
+            instructions.push(Evex(evex));
+        } else {
+            instructions.push(instruction);
+        }
+    }
+    Lowering {
+        memory: lowering.memory,
+        instructions,
+    }
+}
+
+/// `instruction` with its memory operand relative to REGISTER_SCRATCH + `displacement`
+fn displaced(instruction: &HostInstruction, displacement: i32) -> HostInstruction {
+    match instruction {
+        HostInstruction::Evex(evex) => match evex.rm {
+            Rm::Mem(_, own) => {
+                HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, displacement + own))
+            }
+            Rm::Vsib {
+                index, scale, disp, ..
+            } => HostInstruction::Evex(evex.vsib(
+                REGISTER_SCRATCH,
+                index,
+                scale,
+                displacement + disp,
+            )),
+            Rm::Reg(_) => *instruction,
+        },
+        other => *other,
+    }
+}
+
 /// `bcast.*`: the lane moves to the bottom of xmm30 (valign, or vextracti32x4 and vpsrldq for
 /// bytes and words), then vpbroadcast
 fn lower_broadcast(v: &VectorInsn) -> Vec<HostInstruction> {
@@ -849,9 +911,11 @@ fn lower_sha(v: &VectorInsn) -> Vec<HostInstruction> {
     let usable = |reg: u8| reg < 16 && !(rnds2 && reg == 0);
     let mut free = (rnds2 as u8..16).filter(|reg| ![o, a, b].contains(reg));
     let to = if usable(o) { o } else { free.next().unwrap() };
-    let ta = if usable(a) {
+    // ModRM 0xff followed by the imm8 of sha1rnds4, see [lower_sanitized]
+    let gadget = |rm: u8| imm8.is_some() && to & 7 == 7 && rm & 7 == 7;
+    let ta = if usable(a) && !gadget(a) {
         a
-    } else if a == o {
+    } else if a == o && !gadget(to) {
         to
     } else {
         free.next().unwrap()
@@ -986,32 +1050,146 @@ pub(crate) fn gather_scatter_bound(
     sequence
 }
 
+// Longest encodings of the general purpose instructions emitted around the lowerings, each plus
+// a random noop
+/// jcc rel32
+const JCC: usize = 7;
+/// jmp or call rel32
+const JMP: usize = 6;
+/// REX, opcode, ModRM with register operands (also test, cmp, xor, movsxd, call rax)
+const ALU: usize = 4;
+/// REX, c1 /x, ModRM, imm8
+const SHIFT: usize = 5;
+/// REX, 81 /x, ModRM, imm32 (also cmp)
+const ALU_IMMEDIATE: usize = 8;
+/// REX, opcode, ModRM, SIB, disp8: load or store of a red zone slot
+const STACK: usize = 6;
+/// REX, c7, ModRM, SIB, disp8, imm32
+const STACK_IMMEDIATE: usize = 10;
+/// REX, b8+r, imm64
+const LOAD_IMMEDIATE: usize = 11;
+/// REX, 81 /7, ModRM, disp32, imm32: emit_check_result_is_ok
+const RESULT_CHECK: usize = 12;
+/// EVEX, opcode, ModRM: vmovdqa64 or vpxord of registers
+const EVEX_REGISTERS: usize = 7;
+/// kmovq, kxnorq or kortest (no noop)
+const OPMASK: usize = 5;
+/// emit_sanitized_load_immediate of an i32
+const SANITIZED_I32: usize = LOAD_IMMEDIATE + ALU_IMMEDIATE;
+/// emit_sanitized_load_immediate into REGISTER_SCRATCH
+const SANITIZED_I64: usize = LOAD_IMMEDIATE + 2 * ALU_IMMEDIATE + SHIFT;
+/// emit_vm_address or emit_r1_plus_off
+const VM_ADDRESS: usize = SANITIZED_I32 + ALU;
+/// emit_vector_translation_call
+const TRANSLATION_CALL: usize = STACK_IMMEDIATE + JMP;
+/// emit_vector_cu_check
+const CU_CHECK: usize = 3 * ALU_IMMEDIATE + 2 * JCC + LOAD_IMMEDIATE + JMP;
+/// Entry of a memory run at a later op: xor, jmp
+const RUN_ENTRY: usize = ALU + JMP;
+
+/// Machine code length of the instructions with a random noop each
+fn instructions_length<'a>(instructions: impl IntoIterator<Item = &'a HostInstruction>) -> usize {
+    instructions
+        .into_iter()
+        .map(|instruction| instruction.length() + 1)
+        .sum()
+}
+
 /// Upper bound of the machine code length of a vector op, including its share of a memory run
 pub(super) fn max_machine_code_length(v: &VectorInsn, registers_used: u32) -> usize {
-    // Longest EVEX encoding plus a noop
-    const PER_INSTRUCTION: usize = 14;
-    // CU check and meter adjustment
-    const CU_CHECK: usize = 64;
-    // r1 + off (sanitized), the pc or span length slot and the call
-    const ACCESS: usize = 80;
-    // Span translation call, access check, fallback jumps and entry
-    const RUN: usize = 160;
-    let lowering = lower(v);
-    let instructions = lowering.instructions.len() * PER_INSTRUCTION;
-    let host_call = 2 * (registers_used.count_ones() as usize + 1) * PER_INSTRUCTION + 192;
-    let mut length = CU_CHECK + instructions;
-    if let Some((_, len)) = lowering.memory {
-        // The access in a run and its fallback
-        length += RUN + ACCESS + instructions;
-        if !TRANSLATION_LENGTHS.contains(&len) {
-            // One access per register
-            length += lowering.instructions.len() * (ACCESS + PER_INSTRUCTION);
-        }
-    }
+    let lowering = lower_sanitized(v);
+    let mut length = if v.info.cu(v.imm8) > 1 { CU_CHECK } else { 0 };
     if matches!(v.info.kind, Kind::Ga | Kind::Sc) {
-        length += 64 * PER_INSTRUCTION + 2 * ACCESS + host_call;
+        return length + max_gather_scatter_length(v, &lowering, registers_used);
     }
+    length += RUN_ENTRY;
+    let Some((_, len)) = lowering.memory else {
+        return length + instructions_length(&lowering.instructions);
+    };
+    let displaced_length = instructions_length(
+        &lowering
+            .instructions
+            .iter()
+            .map(|instruction| displaced(instruction, 1))
+            .collect::<Vec<_>>(),
+    );
+    // emit_vector_memory_access
+    let access = if TRANSLATION_LENGTHS.contains(&len) {
+        VM_ADDRESS + TRANSLATION_CALL + instructions_length(&lowering.instructions)
+    } else {
+        let span = VM_ADDRESS + STACK_IMMEDIATE + JMP + ALU + JCC + displaced_length + JMP;
+        let registers: usize = lowering
+            .instructions
+            .iter()
+            .map(|instruction| match instruction {
+                HostInstruction::Evex(evex) => {
+                    VM_ADDRESS
+                        + TRANSLATION_CALL
+                        + HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, 0)).length()
+                        + 1
+                }
+                _ => unreachable!("ldn and stn are vmovdqu64 only"),
+            })
+            .sum();
+        span + registers
+    };
+    // In a memory run: its start, the access, the jump over the fallbacks and the fallback
     length
+        + VM_ADDRESS
+        + STACK_IMMEDIATE
+        + JMP
+        + ALU_IMMEDIATE
+        + JCC
+        + ALU
+        + JCC
+        + displaced_length
+        + JMP
+        + access
+        + ALU
+        + JMP
+}
+
+/// Upper bound of the machine code length of [JitCompiler::emit_gather_scatter]
+fn max_gather_scatter_length(v: &VectorInsn, lowering: &Lowering, registers_used: u32) -> usize {
+    let (qword_index, _, _) = gather_scatter_shape(v.info.op);
+    let mask = if v.mode == 0 {
+        OPMASK
+    } else {
+        2 * OPMASK + JCC
+    };
+    let bounds = instructions_length(&gather_scatter_bound(v, false, RAX))
+        + instructions_length(&gather_scatter_bound(v, true, RCX));
+    let index =
+        2 * if qword_index { 2 * ALU + JCC } else { ALU } + if v.imm8 != 0 { 2 * SHIFT } else { 0 };
+    let span = VM_ADDRESS + 4 * ALU + ALU_IMMEDIATE + STACK + JMP + JCC;
+    let native = instructions_length(&[displaced(&lowering.instructions[0], 1)]);
+    let fast = 2 * STACK + bounds + index + span + 2 * STACK + 3 * EVEX_REGISTERS + native + JMP;
+    let slow = 2 * STACK + SANITIZED_I64 + max_rust_call_length(registers_used, 4) + RESULT_CHECK;
+    let empty = if v.mode != 0 { JMP + EVEX_REGISTERS } else { 0 };
+    mask + fast + slow + LOAD_IMMEDIATE + JCC + empty
+}
+
+/// Upper bound of the machine code length of [JitCompiler::emit_rust_call] with `arguments`
+/// register arguments, a constant target and no result
+fn max_rust_call_length(registers_used: u32, arguments: usize) -> usize {
+    let spill = HostInstruction::Evex(
+        EvexInstruction::rr(PF3, M0F, true, 0x7f, 0, 0).mem(REGISTER_PTR_TO_VM, 1),
+    )
+    .length()
+        + 1;
+    let used = (registers_used & ((1 << VECTOR_REGISTERS) - 1)).count_ones() as usize;
+    // push and pop, r8-r15 need a REX prefix
+    let saved: usize = CALLER_SAVED_REGISTERS
+        .iter()
+        .map(|reg| 2 + (*reg as usize >= 8) as usize)
+        .sum();
+    2 * used * spill
+        + VZEROUPPER.len()
+        + 2 * saved
+        + arguments * ALU
+        + LOAD_IMMEDIATE
+        + ALU
+        + ALU_IMMEDIATE
 }
 
 /// Sum of [max_machine_code_length] of the vector ops in `prog`
@@ -1056,7 +1234,21 @@ impl<C: ContextObject> JitCompiler<'_, C> {
                 self.emit_bytes(&bytes[..len]);
             }
         }
+        // 0xff followed by the next instruction (EVEX 0x62) or a noop decodes as a jmp or call
+        // through a guest register, `ff fc` is invalid. The ABI keeps DF clear.
+        if self.config.sanitize_user_provided_values && instruction.ends_in_0xff() {
+            self.emit::<u8>(0xfc); // cld
+        }
         self.emit_random_noop();
+    }
+
+    /// [lower] or, with sanitized user values, [lower_sanitized]
+    fn lower(&self, v: &VectorInsn) -> Lowering {
+        if self.config.sanitize_user_provided_values {
+            lower_sanitized(v)
+        } else {
+            lower(v)
+        }
     }
 
     fn emit_bytes(&mut self, bytes: &[u8]) {
@@ -1091,7 +1283,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             runs.budget += budget;
         }
         self.emit_vector_cu_check(&vector_insn);
-        let lowering = lower(&vector_insn);
+        let lowering = self.lower(&vector_insn);
         if matches!(vector_insn.info.kind, Kind::Ga | Kind::Sc) {
             self.emit_gather_scatter(&vector_insn, &lowering);
         } else if lowering.memory.is_some() {
@@ -1117,6 +1309,11 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         assert!(
             runs.run.is_some() || self.offset_in_text_section - runs.budget_start <= runs.budget
         );
+        #[cfg(test)]
+        if runs.run.is_none() {
+            let used = self.offset_in_text_section - runs.budget_start;
+            BUDGET_USE.with(|sums| sums.set((sums.get().0 + used, sums.get().1 + runs.budget)));
+        }
         Ok(())
     }
 
@@ -1225,32 +1422,15 @@ impl<C: ContextObject> JitCompiler<'_, C> {
 
     /// The span translation subroutines, if the region layout and the mapping allow them
     fn inline_span_translation(&self) -> Option<[usize; 2]> {
-        self.vector_memory_runs
-            .span_translation
-            .filter(|_| self.config.aligned_memory_mapping)
+        self.vector_memory_runs.span_translation.filter(|_| {
+            vector::aligned_memory_mapping(self.config, self.executable.get_sbpf_version())
+        })
     }
 
     /// Emits the lowering with the memory operands relative to REGISTER_SCRATCH + `displacement`
     fn emit_displaced(&mut self, lowering: &Lowering, displacement: i32) {
         for instruction in &lowering.instructions {
-            let instruction = match instruction {
-                HostInstruction::Evex(evex) => match evex.rm {
-                    Rm::Mem(_, own) => {
-                        HostInstruction::Evex(evex.mem(REGISTER_SCRATCH, displacement + own))
-                    }
-                    Rm::Vsib {
-                        index, scale, disp, ..
-                    } => HostInstruction::Evex(evex.vsib(
-                        REGISTER_SCRATCH,
-                        index,
-                        scale,
-                        displacement + disp,
-                    )),
-                    Rm::Reg(_) => *instruction,
-                },
-                other => *other,
-            };
-            self.emit_host_instruction(&instruction);
+            self.emit_host_instruction(&displaced(instruction, displacement));
         }
     }
 
@@ -1551,7 +1731,9 @@ impl<C: ContextObject> JitCompiler<'_, C> {
             return;
         };
         // The tracer clobbers REGISTER_SCRATCH before every instruction
-        if cfg!(feature = "tracer") || !self.config.aligned_memory_mapping {
+        if cfg!(feature = "tracer")
+            || !vector::aligned_memory_mapping(self.config, self.executable.get_sbpf_version())
+        {
             return;
         }
         if self.vector_memory_runs.jump_targets.is_empty() {
@@ -1659,7 +1841,7 @@ impl<C: ContextObject> JitCompiler<'_, C> {
         self.emit_ins(X86Instruction::jump_immediate(0));
         for fallback in run.fallbacks {
             self.patch_rel32(fallback.jump);
-            let lowering = lower(&fallback.insn);
+            let lowering = self.lower(&fallback.insn);
             self.emit_vector_memory_access(&fallback.insn, &lowering, fallback.pc);
             // Keep using the fallbacks until the end of the run
             self.emit_ins(X86Instruction::alu(
@@ -2338,6 +2520,8 @@ impl<C: ContextObject> JitCompiler<'_, C> {
 thread_local! {
     /// Number of calls of the slow path on this thread
     static SLOW_PATH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Sums of the machine code lengths of vector ops and of their bounds on this thread
+    static BUDGET_USE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
@@ -3161,6 +3345,157 @@ mod tests {
         }
     }
 
+    /// [VectorInsn::max_machine_code_length] of the verifier is at least [max_machine_code_length]
+    #[test]
+    fn test_verifier_machine_code_length() {
+        for info in OPS.iter().filter(|info| info.implemented) {
+            let kind = info.kind;
+            for imm8 in (0..=255).filter(|imm8| info.imm8_is_valid(*imm8)) {
+                for mode in 0..3 {
+                    for registers in 0..27 {
+                        let reg = |field: u32, used: bool| {
+                            [7, 15, 23][(registers / 3u8.pow(field) % 3) as usize] * used as u8
+                        };
+                        let word = encode_masked(
+                            info.op,
+                            imm8,
+                            reg(0, kind.uses_out()),
+                            reg(1, kind.uses_in0()),
+                            reg(2, kind.uses_in1()),
+                            0,
+                            mode,
+                        );
+                        let Ok(v) = VectorInsn::decode(&ebpf::get_insn(&word.to_le_bytes(), 0))
+                        else {
+                            continue;
+                        };
+                        assert!(
+                            max_machine_code_length(&v, u32::MAX) <= v.max_machine_code_length(),
+                            "{}",
+                            v
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sanitized code of [lower_sanitized] (with the `cld` of
+    /// [JitCompiler::emit_host_instruction]) followed by an EVEX instruction or a noop never
+    /// contains 0xff followed by a byte which makes it a jmp or call
+    #[test]
+    fn test_lower_sanitized_no_jump_gadgets() {
+        for info in OPS.iter().filter(|info| info.implemented) {
+            let kind = info.kind;
+            for imm8 in (0..=255).filter(|imm8| info.imm8_is_valid(*imm8)) {
+                for mode in 0..3 {
+                    for registers in 0..27 {
+                        let reg = |field: u32, used: bool| {
+                            [7, 15, 23][(registers / 3u8.pow(field) % 3) as usize] * used as u8
+                        };
+                        let word = encode_masked(
+                            info.op,
+                            imm8,
+                            reg(0, kind.uses_out()),
+                            reg(1, kind.uses_in0()),
+                            reg(2, kind.uses_in1()),
+                            0,
+                            mode,
+                        );
+                        let Ok(v) = VectorInsn::decode(&ebpf::get_insn(&word.to_le_bytes(), 0))
+                        else {
+                            continue;
+                        };
+                        for next in [0x62, 0x90] {
+                            let mut code = vec![];
+                            for instruction in lower_sanitized(&v).instructions {
+                                code.extend(instruction.encode());
+                                if instruction.ends_in_0xff() {
+                                    code.push(0xfc);
+                                }
+                                code.push(next);
+                            }
+                            assert!(
+                                !code.windows(2).any(|bytes| bytes[0] == 0xff
+                                    && matches!((bytes[1] >> 3) & 7, 2..=5)),
+                                "{} {:x?}",
+                                v,
+                                code
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [max_machine_code_length] holds for random programs of all ops with a noop after every
+    /// instruction (emit_vector_op asserts it)
+    #[test]
+    fn test_machine_code_length_bound() {
+        use rand::{rngs::SmallRng, Rng, SeedableRng};
+        if vector::missing_host_feature().is_some() {
+            return;
+        }
+        let ops: Vec<_> = OPS.iter().filter(|info| info.implemented).collect();
+        let mut rng = SmallRng::seed_from_u64(0);
+        let random_op = |rng: &mut SmallRng| loop {
+            let info = ops[rng.gen_range(0..ops.len())];
+            let imm8 = if info.imm8_is_count() {
+                rng.gen_range(2..=30)
+            } else {
+                rng.gen()
+            };
+            let mut reg = |used: bool| rng.gen_range(0..30) * used as u8;
+            let (out, in0, in1) = (
+                reg(info.kind.uses_out()),
+                reg(info.kind.uses_in0()),
+                reg(info.kind.uses_in1()),
+            );
+            let off = if info.accesses_memory() { rng.gen() } else { 0 };
+            let word = encode_masked(info.op, imm8, out, in0, in1, off, rng.gen_range(0..3));
+            if VectorInsn::decode(&ebpf::get_insn(&word.to_le_bytes(), 0)).is_ok() {
+                return word;
+            }
+        };
+        for iteration in 0..400 {
+            let mut words = vec![];
+            for _ in 0..rng.gen_range(1..200) {
+                words.push(if rng.gen_ratio(1, 16) {
+                    // Ends memory runs
+                    ebpf::ADD64_IMM as u64 | 1 << 8 | (rng.gen::<u32>() as u64) << 32
+                } else {
+                    random_op(&mut rng)
+                });
+            }
+            words.push(ebpf::EXIT as u64);
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let config = Config {
+                enable_vector_ops: true,
+                aligned_memory_mapping: iteration % 4 != 0,
+                sanitize_user_provided_values: iteration % 2 == 0,
+                enable_instruction_meter: iteration % 3 != 0,
+                instruction_meter_checkpoint_distance: [1, 7, 1000][iteration % 3],
+                noop_instruction_rate: 1,
+                ..Config::default()
+            };
+            let executable = Executable::<Context>::from_text_bytes(
+                &bytes,
+                Arc::new(BuiltinProgram::new_loader(config)),
+                SBPFVersion::V3,
+                FunctionRegistry::default(),
+            )
+            .unwrap();
+            let mut compiler = JitCompiler::new(&executable).unwrap();
+            compiler.noop_range = Uniform::new_inclusive(0, 0);
+            compiler.next_noop_insertion = 0;
+            compiler.compile().unwrap();
+        }
+        let (used, budget) = BUDGET_USE.with(|sums| sums.get());
+        assert!(used <= budget);
+        eprintln!("vector ops: {used} bytes, bound {budget} bytes");
+    }
+
     struct Context {
         remaining: u64,
         memory_mapping: MemoryMapping,
@@ -3181,7 +3516,7 @@ mod tests {
     /// In-bounds accesses of an aligned mapping never take the slow path
     #[test]
     fn test_inline_translation_fast_path() {
-        if missing_host_feature().is_some() {
+        if vector::missing_host_feature().is_some() {
             return;
         }
         let ldxdw = |dst: u8, src: u8, off: i16| {
@@ -3202,7 +3537,13 @@ mod tests {
                 ebpf::EXIT as u64,
             ]
         };
-        for aligned_memory_mapping in [false, true] {
+        let versions = [
+            (SBPFVersion::V3, false),
+            (SBPFVersion::V3, true),
+            (SBPFVersion::V4, false),
+        ];
+        for (sbpf_version, aligned_memory_mapping) in versions {
+            let aligned = aligned_memory_mapping || sbpf_version == SBPFVersion::V4;
             for (offset, expected_slow_path_calls) in [(0, 0), (56, 0), (57, 1)] {
                 let config = Config {
                     enable_vector_ops: true,
@@ -3217,13 +3558,17 @@ mod tests {
                 let executable = Executable::<Context>::from_text_bytes(
                     &bytes,
                     loader.clone(),
-                    SBPFVersion::V3,
+                    sbpf_version,
                     FunctionRegistry::default(),
                 )
                 .unwrap();
-                executable
-                    .verify::<crate::verifier::RequisiteVerifier>()
-                    .unwrap();
+                // Unaligned: rejected, but the JIT still has to translate correctly
+                assert_eq!(
+                    executable
+                        .verify::<crate::verifier::RequisiteVerifier>()
+                        .is_ok(),
+                    aligned
+                );
                 executable.jit_compile().unwrap();
                 let mut stack =
                     AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(config.stack_size());
@@ -3236,10 +3581,10 @@ mod tests {
                 let mut context = Context {
                     remaining: 100,
                     memory_mapping: unsafe {
-                        MemoryMapping::new(regions, &config, SBPFVersion::V3).unwrap()
+                        MemoryMapping::new(regions, &config, sbpf_version).unwrap()
                     },
                 };
-                let mut vm = EbpfVm::new(loader, SBPFVersion::V3, &mut context, stack.len());
+                let mut vm = EbpfVm::new(loader, sbpf_version, &mut context, stack.len());
                 vm.registers[1] = ebpf::MM_INPUT_START;
                 SLOW_PATH_CALLS.with(|calls| calls.set(0));
                 let (_, result) = vm.execute_program(
@@ -3248,7 +3593,7 @@ mod tests {
                     &mut [CallFrame::default()],
                 );
                 let slow_path_calls = SLOW_PATH_CALLS.with(|calls| calls.get());
-                if aligned_memory_mapping {
+                if aligned {
                     assert_eq!(slow_path_calls, expected_slow_path_calls, "{offset}");
                 } else {
                     // Every access translates through the slow path, up to the faulting one

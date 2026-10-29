@@ -75,8 +75,8 @@ pub enum EbpfError {
     /// Syscall error
     #[error("Syscall error: {0}")]
     SyscallError(Box<dyn Error>),
-    /// The host CPU lacks features which the JIT needs for this program
-    #[error("the host CPU lacks features required to JIT compile this program: {0}")]
+    /// The host CPU lacks a feature the vector ops require
+    #[error("the host CPU lacks a feature the vector ops require: {0}")]
     UnsupportedHostFeatures(&'static str),
 }
 

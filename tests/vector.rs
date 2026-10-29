@@ -11,8 +11,8 @@ use solana_sbpf::{
     memory_region::{AccessType, AccessViolationHandler, MemoryRegion},
     program::{BuiltinFunctionDefinition, BuiltinProgram, FunctionRegistry, SBPFVersion},
     vector::{
-        encode, encode_masked, encode_with_offset, op, op_info, Kind, Mask, OpInfo, VectorRegister,
-        OPS, VECTOR_REGISTERS,
+        encode, encode_masked, encode_with_offset, is_vector_op, op, op_info, Kind, Mask, OpInfo,
+        VectorInsn, VectorRegister, MAX_VECTOR_MACHINE_CODE_LENGTH, OPS, VECTOR_REGISTERS,
     },
     verifier::{RequisiteVerifier, VerifierError},
     vm::{CallFrame, Config, ExecutionMode},
@@ -136,9 +136,18 @@ fn executable(
     .unwrap()
 }
 
+const ALIGNED_MAPPING: &str = "vector ops require the aligned memory mapping";
+
+/// Without the aligned mapping programs with vector ops fail verification. The engines still have
+/// to agree on them, so they are returned unverified.
 fn verified(words: &[u64], config: Config) -> Executable<TestContextObject> {
+    let aligned = config.aligned_memory_mapping;
     let executable = executable(words, config, SBPFVersion::V3);
-    executable.verify::<RequisiteVerifier>().unwrap();
+    match executable.verify::<RequisiteVerifier>() {
+        Err(EbpfError::VerifierError(VerifierError::InvalidVectorOp(_, ALIGNED_MAPPING)))
+            if !aligned => {}
+        result => result.unwrap(),
+    }
     executable
 }
 
@@ -272,24 +281,13 @@ fn run(
     }
 }
 
-/// Whether this host can run the vector op JIT
+/// Whether this build has the JIT (loaders with vector ops require the host features)
 fn jit_available() -> bool {
-    #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-    {
-        let executable = executable(
-            &[vop(op::ZERO, 0, 0, 0, 0), exit()],
-            config(true, true),
-            SBPFVersion::V3,
-        );
-        match executable.jit_compile() {
-            Ok(()) => return true,
-            Err(EbpfError::UnsupportedHostFeatures(feature)) => {
-                eprintln!("skipping JIT checks, the host lacks {feature}");
-            }
-            Err(err) => panic!("{:?}", err),
-        }
-    }
-    false
+    cfg!(all(
+        feature = "jit",
+        not(target_os = "windows"),
+        target_arch = "x86_64"
+    ))
 }
 
 /// Runs the program in the interpreter and (if possible) the JIT and checks they agree
@@ -395,6 +393,8 @@ fn test_vector_ops_interpreter_vs_jit() {
         (1, 2, 0),
         (20, 0, 21),
         (16, 18, 16),
+        (7, 15, 23),
+        (23, 7, 7),
     ];
     // Input: three vectors, the memory the op accesses, then the scalar registers at the end
     const AREA: usize = 192;
@@ -959,6 +959,120 @@ fn test_vector_ops_disabled() {
             })
             .collect();
         assert_eq!(lengths[0], lengths[1]);
+    }
+}
+
+/// Programs with vector ops need the aligned memory mapping (SBPFv4 always has it)
+#[test]
+fn test_vector_ops_require_aligned_memory_mapping() {
+    let words = [mov64_imm(0, 1), vop(op::ZERO, 0, 1, 0, 0), exit()];
+    let result =
+        executable(&words, config(true, false), SBPFVersion::V3).verify::<RequisiteVerifier>();
+    assert!(
+        matches!(
+            result,
+            Err(EbpfError::VerifierError(VerifierError::InvalidVectorOp(
+                1,
+                ALIGNED_MAPPING
+            )))
+        ),
+        "{:?}",
+        result
+    );
+    executable(&words, config(true, false), SBPFVersion::V4)
+        .verify::<RequisiteVerifier>()
+        .unwrap();
+    executable(&words[..1], config(true, false), SBPFVersion::V3)
+        .verify::<RequisiteVerifier>()
+        .unwrap();
+}
+
+/// The JIT sizes its output from a bound per op: an unverified program of 70,000 of the costliest
+/// op (above the verifier limit) compiles and one too large for rel32 jumps fails cleanly
+#[test]
+fn test_jit_code_length_of_large_programs() {
+    if !jit_available() {
+        return;
+    }
+    let compile = |count: usize| {
+        let mut words = vec![encode_with_offset(op::LDN, 30, 0, 0, 0, 0); count];
+        words.push(exit());
+        executable(&words, config(true, true), SBPFVersion::V3).jit_compile()
+    };
+    compile(70_000).unwrap();
+    assert!(matches!(
+        compile(1_000_000),
+        Err(EbpfError::ExhaustedTextSegment(1_000_001))
+    ));
+}
+
+/// With sanitized user values no vector op emits ModRM 0xff followed by its imm8, which decodes
+/// as `jmp` or `call` to a guest register
+#[test]
+fn test_jit_no_jump_gadgets() {
+    if !jit_available() {
+        return;
+    }
+    let ops = [
+        (vop(op::TERNLOG, 0xe0, 7, 1, 7), [0xff, 0xe0]),
+        (vop(op::TERNLOG, 0xd0, 7, 1, 7), [0xff, 0xd0]),
+        (vop(op::SHUFD, 0xe6, 7, 7, 0), [0xff, 0xe6]),
+        (vop(op::EXTRACT256, 1, 15, 23, 0), [0xff, 0x01]),
+    ];
+    for sanitize_user_provided_values in [false, true] {
+        for (word, gadget) in ops {
+            let mut words = vec![word; 16];
+            words.push(exit());
+            let config = Config {
+                sanitize_user_provided_values,
+                ..config(true, true)
+            };
+            let executable = verified(&words, config);
+            executable.jit_compile().unwrap();
+            let program = executable.get_compiled_program().unwrap();
+            let offset = |pc: usize| program.pc_section()[pc] as usize & i32::MAX as usize;
+            for pc in 0..16 {
+                let code = &program.text_section()[offset(pc)..offset(pc + 1)];
+                assert_eq!(
+                    code.windows(2).any(|bytes| bytes == gadget),
+                    !sanitize_user_provided_values,
+                    "{word:#x} {code:x?}"
+                );
+            }
+        }
+    }
+    // A last byte 0xff (imm8 or ModRM) followed by the next instruction: `jmp [rdx+disp8]`. The
+    // tracer emits calls in between, their rel32 can contain jumps.
+    let next = vop(op::ADD_D, 0, 0, 0, 0);
+    for word in [
+        vop(op::TERNLOG, 0xff, 1, 2, 3),
+        vop(op::SHUFD, 0xff, 1, 2, 0),
+        vop(op::ADD_D, 0, 7, 0, 7),
+    ] {
+        for sanitize_user_provided_values in [false, true] {
+            let mut words = [word, next].repeat(16);
+            words.push(exit());
+            let config = Config {
+                sanitize_user_provided_values,
+                ..config(true, true)
+            };
+            let executable = verified(&words, config);
+            executable.jit_compile().unwrap();
+            let program = executable.get_compiled_program().unwrap();
+            let offset = |pc: usize| program.pc_section()[pc] as usize & i32::MAX as usize;
+            let code = &program.text_section()[offset(0)..offset(32) + 1];
+            let jumps = code
+                .windows(2)
+                .filter(|bytes| bytes[0] == 0xff && matches!((bytes[1] >> 3) & 7, 2..=5))
+                .count();
+            if !cfg!(feature = "tracer") {
+                assert_eq!(
+                    jumps == 0,
+                    sanitize_user_provided_values,
+                    "{word:#x} {code:x?}"
+                );
+            }
+        }
     }
 }
 
@@ -4595,6 +4709,74 @@ mod native {
                     compare(info, 0, mode, &c, &a, &b, r2);
                 }
             }
+        }
+    }
+}
+
+/// The sum of [VectorInsn::max_machine_code_length] is limited, the largest accepted program
+/// compiles
+#[test]
+fn test_vector_machine_code_limit() {
+    let ldn = encode_with_offset(op::LDN, 30, 0, 0, 0, 0);
+    let v = VectorInsn::decode(&ebpf::get_insn(&ldn.to_le_bytes(), 0)).unwrap();
+    let n = MAX_VECTOR_MACHINE_CODE_LENGTH / v.max_machine_code_length();
+    let mut words = vec![ldn; n + 1];
+    words.push(exit());
+    let result =
+        executable(&words, config(true, true), SBPFVersion::V3).verify::<RequisiteVerifier>();
+    assert!(
+        matches!(&result, Err(EbpfError::VerifierError(VerifierError::InvalidVectorOp(pc, "vector ops exceed the machine code limit"))) if *pc == n),
+        "{:?}",
+        result
+    );
+    words.remove(0);
+    let executable = verified(&words, config(true, true));
+    if jit_available() {
+        executable.jit_compile().unwrap();
+        let length = executable
+            .get_compiled_program()
+            .unwrap()
+            .text_section()
+            .len();
+        assert!(length < MAX_VECTOR_MACHINE_CODE_LENGTH, "{}", length);
+    }
+}
+
+/// Every program under `../programs` verifies, with a large margin to the vector machine code
+/// limit
+#[test]
+fn test_programs_below_machine_code_limit() {
+    let Ok(dirs) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../programs")) else {
+        return;
+    };
+    for dir in dirs {
+        let release = dir
+            .unwrap()
+            .path()
+            .join("target/bpfel-unknown-none/release");
+        let Ok(files) = std::fs::read_dir(release) else {
+            continue;
+        };
+        for path in files.map(|file| file.unwrap().path()) {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("so") {
+                continue;
+            }
+            let elf = std::fs::read(&path).unwrap();
+            let loader = Arc::new(BuiltinProgram::new_loader(config(true, true)));
+            let executable = Executable::<TestContextObject>::from_elf(&elf, loader).unwrap();
+            executable.verify::<RequisiteVerifier>().unwrap();
+            let text = executable.get_text_bytes().1;
+            let length: usize = (0..text.len() / ebpf::INSN_SIZE)
+                .map(|pc| ebpf::get_insn(text, pc))
+                .filter(|insn| is_vector_op(insn, true, executable.get_sbpf_version()))
+                .map(|insn| VectorInsn::decode(&insn).unwrap().max_machine_code_length())
+                .sum();
+            assert!(
+                length < MAX_VECTOR_MACHINE_CODE_LENGTH / 8,
+                "{} {}",
+                path.display(),
+                length
+            );
         }
     }
 }

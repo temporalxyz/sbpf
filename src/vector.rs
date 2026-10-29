@@ -25,7 +25,7 @@ use crate::{
     memory_region::AccessType,
     program::SBPFVersion,
     verifier::VerifierError,
-    vm::{ContextObject, EbpfVm},
+    vm::{Config, ContextObject, EbpfVm},
 };
 
 /// `CALL_IMM` source register value which marks a vector op
@@ -726,6 +726,61 @@ pub fn is_vector_op(insn: &ebpf::Insn, enable_vector_ops: bool, sbpf_version: SB
         && sbpf_version.static_syscalls()
 }
 
+/// Checks that the host CPU has every feature the vector ops require (see SPEC.md).
+///
+/// [BuiltinProgram::new_loader](crate::program::BuiltinProgram::new_loader) refuses a config with
+/// [Config::enable_vector_ops] on a host without them, so that no program can fail on some hosts
+/// only. Validators call this at startup.
+pub fn check_host_features() -> Result<(), EbpfError> {
+    match missing_host_feature() {
+        Some(feature) => Err(EbpfError::UnsupportedHostFeatures(feature)),
+        None => Ok(()),
+    }
+}
+
+/// Returns the name of a required host CPU feature which is missing
+pub(crate) fn missing_host_feature() -> Option<&'static str> {
+    #[cfg(test)]
+    if let Some(feature) = tests::MISSING_HOST_FEATURE.with(|feature| feature.get()) {
+        return Some(feature);
+    }
+    #[cfg(target_arch = "x86_64")]
+    return [
+        (is_x86_feature_detected!("avx512f"), "avx512f"),
+        (is_x86_feature_detected!("avx512bw"), "avx512bw"),
+        (is_x86_feature_detected!("avx512dq"), "avx512dq"),
+        (is_x86_feature_detected!("avx512vl"), "avx512vl"),
+        (is_x86_feature_detected!("avx512vnni"), "avx512vnni"),
+        (is_x86_feature_detected!("avx512ifma"), "avx512ifma"),
+        (is_x86_feature_detected!("avx512bitalg"), "avx512bitalg"),
+        (
+            is_x86_feature_detected!("avx512vpopcntdq"),
+            "avx512vpopcntdq",
+        ),
+        (is_x86_feature_detected!("vpclmulqdq"), "vpclmulqdq"),
+        (is_x86_feature_detected!("avx512cd"), "avx512cd"),
+        (is_x86_feature_detected!("avx512vbmi"), "avx512vbmi"),
+        (is_x86_feature_detected!("avx512vbmi2"), "avx512vbmi2"),
+        (is_x86_feature_detected!("gfni"), "gfni"),
+        (is_x86_feature_detected!("vaes"), "vaes"),
+        (is_x86_feature_detected!("sha"), "sha"),
+        (is_x86_feature_detected!("popcnt"), "popcnt"),
+        (is_x86_feature_detected!("bmi1"), "bmi1"),
+        (is_x86_feature_detected!("lzcnt"), "lzcnt"),
+    ]
+    .iter()
+    .find_map(|&(detected, name)| (!detected).then_some(name));
+    #[cfg(not(target_arch = "x86_64"))]
+    Some("x86_64")
+}
+
+/// Whether the memory mapping is aligned (as in [crate::memory_region::MemoryMapping::new]),
+/// which programs with vector ops require. With the unaligned mapping every memory access calls
+/// into the host and the JIT spills the vector registers around each one.
+pub(crate) fn aligned_memory_mapping(config: &Config, sbpf_version: SBPFVersion) -> bool {
+    sbpf_version >= SBPFVersion::V4 || config.aligned_memory_mapping
+}
+
 /// A decoded and validated vector op
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VectorInsn {
@@ -828,6 +883,16 @@ impl VectorInsn {
         self.info.kind.reads_out() || (self.mode == 1 && self.info.kind.uses_out())
     }
 
+    /// Upper bound of the machine code length of the JIT for this op in any config and host
+    pub fn max_machine_code_length(&self) -> usize {
+        match self.info.kind {
+            Kind::Ga | Kind::Sc => 1536,
+            _ if self.info.imm8_is_count() => 256 + 72 * self.imm8 as usize,
+            _ if self.info.accesses_memory() => 256,
+            _ => 192,
+        }
+    }
+
     /// Bit set of the vector registers this op reads or writes
     pub fn registers_used(&self) -> u32 {
         let kind = self.info.kind;
@@ -905,16 +970,37 @@ impl std::fmt::Display for VectorInsn {
     }
 }
 
+/// Limit of the sum of [VectorInsn::max_machine_code_length] of a program. 64 MiB plus the scalar code of a 10 MiB program (138 MiB) is below the 256 MiB pool bucket max, 18x fieldmul.
+pub const MAX_VECTOR_MACHINE_CODE_LENGTH: usize = 64 << 20;
+
 /// Verifier checks of all vector ops in `prog`, used if vector ops are enabled
-pub(crate) fn verify(prog: &[u8], sbpf_version: SBPFVersion) -> Result<(), VerifierError> {
+pub(crate) fn verify(
+    prog: &[u8],
+    config: &Config,
+    sbpf_version: SBPFVersion,
+) -> Result<(), VerifierError> {
+    let mut machine_code_length = 0;
     let mut insn_ptr: usize = 0;
     while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
         let insn = ebpf::get_insn(prog, insn_ptr);
         if insn.opc == ebpf::LD_DW_IMM && !sbpf_version.disable_lddw() {
             insn_ptr += 1;
         } else if is_vector_op(&insn, true, sbpf_version) {
-            VectorInsn::decode(&insn)
+            let v = VectorInsn::decode(&insn)
                 .map_err(|reason| VerifierError::InvalidVectorOp(insn_ptr, reason))?;
+            if !aligned_memory_mapping(config, sbpf_version) {
+                return Err(VerifierError::InvalidVectorOp(
+                    insn_ptr,
+                    "vector ops require the aligned memory mapping",
+                ));
+            }
+            machine_code_length += v.max_machine_code_length();
+            if machine_code_length > MAX_VECTOR_MACHINE_CODE_LENGTH {
+                return Err(VerifierError::InvalidVectorOp(
+                    insn_ptr,
+                    "vector ops exceed the machine code limit",
+                ));
+            }
         }
         insn_ptr += 1;
     }
@@ -946,6 +1032,30 @@ pub(crate) fn registers_used_by_program(prog: &[u8], sbpf_version: SBPFVersion) 
 // Portable reference semantics
 
 type V = VectorRegister;
+
+/// Evaluates `$body` with the constant `$w` set to the lane width `$bytes` (1, 2, 4 or 8)
+macro_rules! with_width {
+    ($bytes:expr, $w:ident => $body:expr) => {
+        match $bytes {
+            1 => {
+                const $w: usize = 1;
+                $body
+            }
+            2 => {
+                const $w: usize = 2;
+                $body
+            }
+            4 => {
+                const $w: usize = 4;
+                $body
+            }
+            _ => {
+                const $w: usize = 8;
+                $body
+            }
+        }
+    };
+}
 
 fn map1<const N: usize>(a: &V, f: impl Fn(u64) -> u64) -> V {
     let mut r = V::ZERO;
@@ -1002,9 +1112,24 @@ fn dot(x: u64, y: u64, bits: u32, n: u32, x_signed: bool, y_signed: bool) -> i64
 }
 
 fn clmul64(x: u64, y: u64) -> u128 {
-    (0..64)
-        .filter(|i| (y >> i) & 1 == 1)
-        .fold(0u128, |acc, i| acc ^ ((x as u128) << i))
+    // Integer products of the bits of x and y in classes mod 5: a bit of a product sums at most
+    // 13 terms, so no carry reaches the next bit of its class
+    const CLASS: u128 = {
+        let (mut m, mut i) = (0, 0);
+        while i < 128 {
+            m |= 1 << i;
+            i += 5;
+        }
+        m
+    };
+    let part = |v: u64, r: usize| (v & (CLASS << r) as u64) as u128;
+    let mut z = [0u128; 5];
+    for r in 0..5 {
+        for s in 0..5 {
+            z[(r + s) % 5] ^= part(x, r) * part(y, s);
+        }
+    }
+    (0..5).fold(0, |product, k| product | (z[k] & (CLASS << k)))
 }
 
 /// High `bits` of (`hi`:`lo`) << `n`, the lanes of `vpshld*`
@@ -1030,18 +1155,6 @@ fn conflict<const N: usize>(a: &V) -> V {
     r
 }
 
-/// Reads lane `i` of `bytes` (1, 2, 4 or 8) bytes, zero extended
-fn lane(v: &V, bytes: usize, i: usize) -> u64 {
-    let mut lane = [0u8; 8];
-    lane[..bytes].copy_from_slice(&v.0[i * bytes..(i + 1) * bytes]);
-    u64::from_le_bytes(lane)
-}
-
-/// Writes the low `bytes` bytes of `value` to lane `i`
-fn set_lane(v: &mut V, bytes: usize, i: usize, value: u64) {
-    v.0[i * bytes..(i + 1) * bytes].copy_from_slice(&value.to_le_bytes()[..bytes]);
-}
-
 /// The dwords d0..d3 of the low 128 bits
 fn low_dwords(v: &V) -> [u32; 4] {
     std::array::from_fn(|k| v.lane::<4>(k) as u32)
@@ -1056,49 +1169,111 @@ fn with_low_dwords(c: &V, d: [u32; 4]) -> V {
     r
 }
 
+/// Lane i (of `bytes` bytes) is all ones if bit i of `bits` is set, otherwise 0
+fn lane_mask(bytes: usize, bits: u64) -> V {
+    let mut r = V::ZERO;
+    if bytes == 1 {
+        for k in 0..8 {
+            // Bit i of the byte to bit 0 of byte i
+            let mut x = (bits >> (8 * k)) & 0xff;
+            x = (x | x << 28) & 0x0000_000f_0000_000f;
+            x = (x | x << 14) & 0x0003_0003_0003_0003;
+            x = (x | x << 7) & BYTES;
+            r.set_lane::<8>(k, x * 0xff);
+        }
+        return r;
+    }
+    with_width!(bytes, N => for i in 0..VECTOR_SIZE / N {
+        r.set_lane::<N>(i, ((bits >> i) & 1).wrapping_neg());
+    });
+    r
+}
+
 /// Lane i (of `bytes` bytes) of the result is lane `f(i).1` of `f(i).0` for i < `lanes`, the rest
 /// is 0
 fn pick<'a>(bytes: usize, lanes: usize, f: impl Fn(usize) -> (&'a V, usize)) -> V {
     let mut r = V::ZERO;
-    for i in 0..lanes {
+    with_width!(bytes, N => for i in 0..lanes {
         let (v, k) = f(i);
-        set_lane(&mut r, bytes, i, lane(v, bytes, k));
+        r.set_lane::<N>(i, v.lane::<N>(k));
+    });
+    r
+}
+
+/// Lane i (of `bytes` bytes) is lane k of the concatenation of `a` and `b`, k the low bits of lane
+/// i of `index`
+#[inline(never)]
+fn perm2(bytes: usize, index: &V, a: &V, b: &V) -> V {
+    let mut tables = [0u8; 2 * VECTOR_SIZE];
+    tables[..VECTOR_SIZE].copy_from_slice(&a.0);
+    tables[VECTOR_SIZE..].copy_from_slice(&b.0);
+    let mut r = V::ZERO;
+    with_width!(bytes, N => for i in 0..VECTOR_SIZE / N {
+        let k = index.lane::<N>(i) as usize & (2 * VECTOR_SIZE / N - 1);
+        r.0[i * N..(i + 1) * N].copy_from_slice(&tables[k * N..(k + 1) * N]);
+    });
+    r
+}
+
+/// Each 128-bit lane: bytes `n`.. of the lanes of `b`, `a` and zeros
+fn align_bytes(a: &V, b: &V, n: usize) -> V {
+    let mut r = V::ZERO;
+    for l in 0..4 {
+        let lane = 16 * l..16 * (l + 1);
+        let mut bytes = [0u8; 48];
+        bytes[..16].copy_from_slice(&b.0[lane.clone()]);
+        bytes[16..32].copy_from_slice(&a.0[lane.clone()]);
+        r.0[lane].copy_from_slice(&bytes[n..n + 16]);
+    }
+    r
+}
+
+/// `f` applied to each 128-bit lane
+fn shift_bytes(a: &V, f: impl Fn(u128) -> u128) -> V {
+    let mut r = V::ZERO;
+    for l in 0..4 {
+        let x = f(a.lane::<8>(2 * l) as u128 | (a.lane::<8>(2 * l + 1) as u128) << 64);
+        r.set_lane::<8>(2 * l, x as u64);
+        r.set_lane::<8>(2 * l + 1, (x >> 64) as u64);
     }
     r
 }
 
 /// Lane i of `x` (of `from` bytes) to lane i of `to` bytes: truncated (`saturate` 0), signed
 /// saturated (1) or unsigned saturated (2). The rest of the result is 0.
-fn narrow(x: &V, from: usize, to: usize, saturate: u8) -> V {
-    let bits = 8 * to as u32;
+// Out of line: inlined into execute_register_op they make it copy every result in pieces
+#[inline(never)]
+fn narrow<const FROM: usize, const TO: usize>(x: &V, saturate: u8) -> V {
+    let bits = 8 * TO as u32;
     let mut r = V::ZERO;
-    for i in 0..VECTOR_SIZE / from {
-        let value = lane(x, from, i);
+    for i in 0..VECTOR_SIZE / FROM {
+        let value = x.lane::<FROM>(i);
         let value = match saturate {
             0 => value,
             1 => sat(
-                sx(value, 8 * from as u32),
+                sx(value, 8 * FROM as u32),
                 -(1i64 << (bits - 1)),
                 (1i64 << (bits - 1)) - 1,
             ),
             _ => value.min(u64::MAX >> (64 - bits)),
         };
-        set_lane(&mut r, to, i, value);
+        r.set_lane::<TO>(i, value);
     }
     r
 }
 
 /// The low lanes of `x` (of `from` bytes) zero or sign extended to lanes of `to` bytes
-fn extend(x: &V, from: usize, to: usize, signed: bool) -> V {
+#[inline(never)]
+fn extend<const FROM: usize, const TO: usize>(x: &V, signed: bool) -> V {
     let mut r = V::ZERO;
-    for i in 0..VECTOR_SIZE / to {
-        let value = lane(x, from, i);
+    for i in 0..VECTOR_SIZE / TO {
+        let value = x.lane::<FROM>(i);
         let value = if signed {
-            sx(value, 8 * from as u32) as u64
+            sx(value, 8 * FROM as u32) as u64
         } else {
             value
         };
-        set_lane(&mut r, to, i, value);
+        r.set_lane::<TO>(i, value);
     }
     r
 }
@@ -1230,49 +1405,105 @@ const AES_INVERSE_SBOX: [u8; 256] = {
     table
 };
 
-/// Bit t of the result is the parity of `x & a.b[7 - t]`, XOR bit t of `c`
-fn gf_affine(a: u64, x: u8, c: u8) -> u8 {
-    (0..8).fold(c, |r, t| {
-        r ^ (((a >> (8 * (7 - t))) as u8 & x).count_ones() as u8 & 1) << t
+const BYTES: u64 = 0x0101_0101_0101_0101;
+
+/// Bytes of `x` with bit i set to 0xff, the others to 0
+fn byte_mask(x: u64, i: u32) -> u64 {
+    ((x >> i) & BYTES) * 0xff
+}
+
+/// The 8 bytes of `x` times the bytes of `y` in GF(2^8)
+fn gf_mul_bytes(mut x: u64, y: u64) -> u64 {
+    let mut product = 0;
+    for i in 0..8 {
+        product ^= x & byte_mask(y, i);
+        x = ((x & (0x7f * BYTES)) << 1) ^ (((x >> 7) & BYTES) * 0x1b);
+    }
+    product
+}
+
+/// Transpose of the 8x8 bit matrix with rows the bytes of `x`
+fn transpose8(mut x: u64) -> u64 {
+    for (shift, mask) in [
+        (7, 0x00aa_00aa_00aa_00aa),
+        (14, 0x0000_cccc_0000_cccc),
+        (28, 0x0000_0000_f0f0_f0f0),
+    ] {
+        let t = (x ^ (x >> shift)) & mask;
+        x ^= t ^ (t << shift);
+    }
+    x
+}
+
+/// Each byte x of `x` to the byte whose bit t is the parity of `x & a.b[7 - t]`, XOR bit t of `c`
+fn gf_affine(a: u64, x: u64, c: u8) -> u64 {
+    // Byte i of the transpose is the column x bit i selects
+    let columns = transpose8(a.swap_bytes());
+    (0..8).fold(c as u64 * BYTES, |r, i| {
+        r ^ (byte_mask(x, i) & (((columns >> (8 * i)) & 0xff) * BYTES))
     })
 }
+
+/// `vgf2p8affineinvqb`
+#[inline(never)]
+fn gf_affine_inverse(a: &V, b: &V, c: u8) -> V {
+    let inverse = VectorRegister(std::array::from_fn(|k| GF_INVERSE[a.0[k] as usize]));
+    map2::<8>(&inverse, b, |x, y| gf_affine(y, x, c))
+}
+
+/// [AES_SBOX] times the column (2, 1, 1, 3) of MixColumns, as row 0..3 in a little-endian word
+const AES_ENC_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let s = AES_SBOX[i];
+        table[i] = u32::from_le_bytes([gf_mul(s, 2), s, s, gf_mul(s, 3)]);
+        i += 1;
+    }
+    table
+};
+
+/// [AES_INVERSE_SBOX] times the column (14, 9, 13, 11) of InvMixColumns
+const AES_DEC_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let s = AES_INVERSE_SBOX[i];
+        table[i] = u32::from_le_bytes([gf_mul(s, 14), gf_mul(s, 9), gf_mul(s, 13), gf_mul(s, 11)]);
+        i += 1;
+    }
+    table
+};
 
 /// One AES round on each 128-bit lane, `inverse` for the equivalent inverse cipher and `last`
 /// without (Inv)MixColumns. Byte k of a lane is row k % 4 of column k / 4 of the state.
 fn aes_round(state: &V, key: &V, inverse: bool, last: bool) -> V {
+    let (sbox, table) = if inverse {
+        (&AES_INVERSE_SBOX, &AES_DEC_TABLE)
+    } else {
+        (&AES_SBOX, &AES_ENC_TABLE)
+    };
     let mut r = V::ZERO;
     for l in 0..4 {
         let s = &state.0[16 * l..16 * (l + 1)];
-        // (Inv)ShiftRows rotates row i by i columns, (Inv)SubBytes commutes with it
-        let mut t: [u8; 16] = std::array::from_fn(|k| {
-            let (row, column) = (k % 4, k / 4);
-            let from = if inverse {
-                column + 4 - row
-            } else {
-                column + row
-            } % 4;
-            let x = s[row + 4 * from] as usize;
-            if inverse {
-                AES_INVERSE_SBOX[x]
-            } else {
-                AES_SBOX[x]
-            }
-        });
-        if !last {
-            let m = if inverse {
-                [14, 11, 13, 9]
-            } else {
-                [2, 3, 1, 1]
+        for column in 0..4 {
+            // (Inv)ShiftRows rotates row i by i columns, (Inv)SubBytes commutes with it
+            let x = |row: usize| {
+                let from = if inverse {
+                    column + 4 - row
+                } else {
+                    column + row
+                } % 4;
+                s[row + 4 * from] as usize
             };
-            for column in t.chunks_mut(4) {
-                let x = [column[0], column[1], column[2], column[3]];
-                for (row, y) in column.iter_mut().enumerate() {
-                    *y = (0..4).fold(0, |sum, j| sum ^ gf_mul(x[j], m[(j + 4 - row) % 4]));
-                }
-            }
-        }
-        for (k, x) in t.iter().enumerate() {
-            r.0[16 * l + k] = x ^ key.0[16 * l + k];
+            // Row i of the (Inv)MixColumns matrix is row 0 rotated by i
+            let word = if last {
+                u32::from_le_bytes(std::array::from_fn(|row| sbox[x(row)]))
+            } else {
+                (0..4).fold(0, |w, row| w ^ table[x(row)].rotate_left(8 * row as u32))
+            };
+            let k = 4 * l + column;
+            r.set_lane::<4>(k, (word ^ key.lane::<4>(k) as u32) as u64);
         }
     }
     r
@@ -1287,14 +1518,11 @@ pub fn apply_mask(info: &OpInfo, imm8: u8, mode: u8, old: &V, result: V, r2: u64
         return result;
     }
     let bytes = info.mask_lane_bytes(imm8);
-    let mut r = result;
-    for i in 0..result_bytes(info.op, imm8) / bytes {
-        if (r2 >> i) & 1 == 0 {
-            let value = if mode == 1 { lane(old, bytes, i) } else { 0 };
-            set_lane(&mut r, bytes, i, value);
-        }
-    }
-    r
+    let lanes = result_bytes(info.op, imm8) / bytes;
+    let above = u64::MAX.checked_shl(lanes as u32).unwrap_or(0);
+    let keep = lane_mask(bytes, r2 | above);
+    let old = if mode == 1 { old } else { &V::ZERO };
+    map3::<8>(&keep, &result, old, |m, x, y| (x & m) | (y & !m))
 }
 
 /// Reference semantics of all ops which only read and write vector registers
@@ -1456,23 +1684,10 @@ pub fn execute_register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
             }
             r
         }
-        op::NARROWUS_D_B | op::NARROWS_D_B | op::NARROWS_D_W | op::NARROW_D_B => {
-            let mut r = V::ZERO;
-            for k in 0..16 {
-                let x = a.lane::<4>(k);
-                match op {
-                    op::NARROWUS_D_B => r.set_lane::<1>(k, x.min(u8::MAX as u64)),
-                    op::NARROWS_D_B => {
-                        r.set_lane::<1>(k, sat(sx(x, 32), i8::MIN as i64, i8::MAX as i64))
-                    }
-                    op::NARROWS_D_W => {
-                        r.set_lane::<2>(k, sat(sx(x, 32), i16::MIN as i64, i16::MAX as i64))
-                    }
-                    _ => r.set_lane::<1>(k, x),
-                }
-            }
-            r
-        }
+        op::NARROW_D_B => narrow::<4, 1>(a, 0),
+        op::NARROWS_D_B => narrow::<4, 1>(a, 1),
+        op::NARROWUS_D_B => narrow::<4, 1>(a, 2),
+        op::NARROWS_D_W => narrow::<4, 2>(a, 1),
         op::ZX_B_D | op::SX_B_D | op::ZX_W_D | op::SX_W_D | op::ZX_D_Q | op::SX_D_Q => {
             let mut r = V::ZERO;
             match op {
@@ -1512,18 +1727,9 @@ pub fn execute_register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
         }),
         op::EXTRACT256 => pick(8, 4, |i| (a, 4 * imm8 as usize + i)),
         op::PERM2I | op::PERM2T => {
-            let bytes = 1 << imm8;
-            let lanes = VECTOR_SIZE / bytes;
             // perm2i: the indices are in out, perm2t: out is the first table
             let (index, table) = if op == op::PERM2I { (c, a) } else { (a, c) };
-            pick(bytes, lanes, |i| {
-                let k = lane(index, bytes, i) as usize & (2 * lanes - 1);
-                if k < lanes {
-                    (table, k)
-                } else {
-                    (b, k - lanes)
-                }
-            })
+            perm2(1 << imm8, index, table, b)
         }
         op::ALIGN_Q => pick(8, 8, |i| {
             let j = i + imm8 as usize;
@@ -1587,39 +1793,21 @@ pub fn execute_register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
             let source = if j < 2 { a } else { b };
             (source, (i & !3) + (imm8 as usize >> (2 * j) & 3))
         }),
-        op::ALIGNR => pick(1, 64, |i| {
-            let j = (i & 15) + imm8 as usize;
-            if j < 16 {
-                (b, (i & !15) + j)
-            } else if j < 32 {
-                (a, (i & !15) + j - 16)
-            } else {
-                (&V::ZERO, 0)
-            }
-        }),
-        op::BSHLI => pick(1, 64, |i| {
-            if i & 15 >= imm8 as usize {
-                (a, i - imm8 as usize)
-            } else {
-                (&V::ZERO, 0)
-            }
-        }),
-        op::BSHRI => pick(1, 64, |i| {
-            if (i & 15) + (imm8 as usize) < 16 {
-                (a, i + imm8 as usize)
-            } else {
-                (&V::ZERO, 0)
-            }
-        }),
+        op::ALIGNR => align_bytes(a, b, imm8 as usize),
+        op::BSHLI => shift_bytes(a, |x| x << (8 * i)),
+        op::BSHRI => shift_bytes(a, |x| x >> (8 * i)),
         op::UNPACKLO | op::UNPACKHI => {
-            let bytes = 1 << imm8;
-            let per_128 = 16 / bytes;
-            let high = if op == op::UNPACKHI { per_128 / 2 } else { 0 };
-            pick(bytes, VECTOR_SIZE / bytes, |i| {
-                let (l, j) = (i / per_128, i % per_128);
-                let source = if j % 2 == 0 { a } else { b };
-                (source, l * per_128 + high + j / 2)
-            })
+            let mut r = V::ZERO;
+            with_width!(1 << imm8, N => {
+                let per_128 = 16 / N;
+                let high = if op == op::UNPACKHI { per_128 / 2 } else { 0 };
+                for i in 0..VECTOR_SIZE / N {
+                    let (l, j) = (i / per_128, i % per_128);
+                    let source = if j % 2 == 0 { a } else { b };
+                    r.set_lane::<N>(i, source.lane::<N>(l * per_128 + high + j / 2));
+                }
+            });
+            r
         }
         op::PACKUS_D => {
             let mut r = V::ZERO;
@@ -1633,26 +1821,26 @@ pub fn execute_register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
             }
             r
         }
-        op::NARROW_D_W => narrow(a, 4, 2, 0),
-        op::NARROWUS_D_W => narrow(a, 4, 2, 2),
-        op::NARROW_Q_B => narrow(a, 8, 1, 0),
-        op::NARROWS_Q_B => narrow(a, 8, 1, 1),
-        op::NARROWUS_Q_B => narrow(a, 8, 1, 2),
-        op::NARROW_Q_W => narrow(a, 8, 2, 0),
-        op::NARROWS_Q_W => narrow(a, 8, 2, 1),
-        op::NARROWUS_Q_W => narrow(a, 8, 2, 2),
-        op::NARROW_Q_D => narrow(a, 8, 4, 0),
-        op::NARROWS_Q_D => narrow(a, 8, 4, 1),
-        op::NARROWUS_Q_D => narrow(a, 8, 4, 2),
-        op::NARROW_W_B => narrow(a, 2, 1, 0),
-        op::NARROWS_W_B => narrow(a, 2, 1, 1),
-        op::NARROWUS_W_B => narrow(a, 2, 1, 2),
-        op::ZX_B_W => extend(a, 1, 2, false),
-        op::SX_B_W => extend(a, 1, 2, true),
-        op::ZX_B_Q => extend(a, 1, 8, false),
-        op::SX_B_Q => extend(a, 1, 8, true),
-        op::ZX_W_Q => extend(a, 2, 8, false),
-        op::SX_W_Q => extend(a, 2, 8, true),
+        op::NARROW_D_W => narrow::<4, 2>(a, 0),
+        op::NARROWUS_D_W => narrow::<4, 2>(a, 2),
+        op::NARROW_Q_B => narrow::<8, 1>(a, 0),
+        op::NARROWS_Q_B => narrow::<8, 1>(a, 1),
+        op::NARROWUS_Q_B => narrow::<8, 1>(a, 2),
+        op::NARROW_Q_W => narrow::<8, 2>(a, 0),
+        op::NARROWS_Q_W => narrow::<8, 2>(a, 1),
+        op::NARROWUS_Q_W => narrow::<8, 2>(a, 2),
+        op::NARROW_Q_D => narrow::<8, 4>(a, 0),
+        op::NARROWS_Q_D => narrow::<8, 4>(a, 1),
+        op::NARROWUS_Q_D => narrow::<8, 4>(a, 2),
+        op::NARROW_W_B => narrow::<2, 1>(a, 0),
+        op::NARROWS_W_B => narrow::<2, 1>(a, 1),
+        op::NARROWUS_W_B => narrow::<2, 1>(a, 2),
+        op::ZX_B_W => extend::<1, 2>(a, false),
+        op::SX_B_W => extend::<1, 2>(a, true),
+        op::ZX_B_Q => extend::<1, 8>(a, false),
+        op::SX_B_Q => extend::<1, 8>(a, true),
+        op::ZX_W_Q => extend::<2, 8>(a, false),
+        op::SX_W_Q => extend::<2, 8>(a, true),
         // arithmetic
         op::MUL52LO => map2::<8>(a, b, |x, y| {
             ((x & M52) as u128 * (y & M52) as u128) as u64 & M52
@@ -1743,19 +1931,9 @@ pub fn execute_register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
             r
         }
         // crypto
-        op::GF2P8MUL => map2::<1>(a, b, |x, y| gf_mul(x as u8, y as u8) as u64),
-        op::GF2P8AFFINE | op::GF2P8AFFINEINV => {
-            let mut r = V::ZERO;
-            for k in 0..VECTOR_SIZE {
-                let x = if op == op::GF2P8AFFINE {
-                    a.0[k]
-                } else {
-                    GF_INVERSE[a.0[k] as usize]
-                };
-                r.0[k] = gf_affine(b.lane::<8>(k / 8), x, imm8);
-            }
-            r
-        }
+        op::GF2P8MUL => map2::<8>(a, b, gf_mul_bytes),
+        op::GF2P8AFFINE => map2::<8>(a, b, |x, y| gf_affine(y, x, imm8)),
+        op::GF2P8AFFINEINV => gf_affine_inverse(a, b, imm8),
         op::AESENC => aes_round(a, b, false, false),
         op::AESENCLAST => aes_round(a, b, false, true),
         op::AESDEC => aes_round(a, b, true, false),
@@ -1780,37 +1958,29 @@ pub fn execute_mask_op(op: u8, imm8: u8, mode: u8, c: &V, a: &V, b: &V, r2: u64)
     let _ = (mode, c);
     Some(match op {
         // data movement
-        op::BLENDM => {
-            let bytes = 1 << imm8;
-            let mut r = V::ZERO;
-            for i in 0..VECTOR_SIZE / bytes {
-                let source = if (r2 >> i) & 1 == 1 { b } else { a };
-                set_lane(&mut r, bytes, i, lane(source, bytes, i));
-            }
-            r
-        }
+        op::BLENDM => map3::<8>(&lane_mask(1 << imm8, r2), a, b, |m, x, y| {
+            (x & !m) | (y & m)
+        }),
         op::COMPRESS | op::EXPAND => {
-            let bytes = 1 << imm8;
             let mut r = if mode == 1 { *c } else { V::ZERO };
-            let active = (0..VECTOR_SIZE / bytes).filter(|i| (r2 >> i) & 1 == 1);
-            for (j, i) in active.enumerate() {
-                if op == op::COMPRESS {
-                    set_lane(&mut r, bytes, j, lane(a, bytes, i));
-                } else {
-                    set_lane(&mut r, bytes, i, lane(a, bytes, j));
+            with_width!(1 << imm8, N => {
+                let mut active = r2 & (u64::MAX >> (64 - VECTOR_SIZE / N));
+                let mut j = 0;
+                while active != 0 {
+                    let i = active.trailing_zeros() as usize;
+                    if op == op::COMPRESS {
+                        r.set_lane::<N>(j, a.lane::<N>(i));
+                    } else {
+                        r.set_lane::<N>(i, a.lane::<N>(j));
+                    }
+                    active &= active - 1;
+                    j += 1;
                 }
-            }
+            });
             r
         }
         // bits, masks, compares
-        op::MOVM_B | op::MOVM_W | op::MOVM_D | op::MOVM_Q => {
-            let bytes = 1 << (op - op::MOVM_B);
-            let mut r = V::ZERO;
-            for i in 0..VECTOR_SIZE / bytes {
-                set_lane(&mut r, bytes, i, mask_of((r2 >> i) & 1 == 1));
-            }
-            r
-        }
+        op::MOVM_B | op::MOVM_W | op::MOVM_D | op::MOVM_Q => lane_mask(1 << (op - op::MOVM_B), r2),
         _ => return None,
     })
 }
@@ -1831,11 +2001,10 @@ pub fn execute_scalar_output_op(op: u8, imm8: u8, a: &V, b: &V, r2: u64) -> Opti
         op::EXTRACT_W => a.lane::<2>(imm8 as usize),
         // bits, masks, compares
         op::CMP => {
-            let bytes = 1 << ((imm8 >> 4) & 3);
-            let bits = 8 * bytes as u32;
             let unsigned = (imm8 >> 3) & 1 == 1;
-            (0..VECTOR_SIZE / bytes).fold(0, |mask, i| {
-                let (x, y) = (lane(a, bytes, i), lane(b, bytes, i));
+            with_width!(1 << ((imm8 >> 4) & 3), N => (0..VECTOR_SIZE / N).fold(0, |mask, i| {
+                let bits = 8 * N as u32;
+                let (x, y) = (a.lane::<N>(i), b.lane::<N>(i));
                 let order = if unsigned {
                     x.cmp(&y)
                 } else {
@@ -1850,18 +2019,17 @@ pub fn execute_scalar_output_op(op: u8, imm8: u8, a: &V, b: &V, r2: u64) -> Opti
                     _ => order.is_gt(),
                 };
                 mask | (condition as u64) << i
-            })
+            }))
         }
         op::BITSHUF => (0..64).fold(0, |mask, i| {
             let bit = (a.lane::<8>(i / 8) >> (b.0[i] & 63)) & 1;
             mask | bit << i
         }),
         op::TEST | op::TESTN => {
-            let bytes = 1 << imm8;
-            (0..VECTOR_SIZE / bytes).fold(0, |mask, i| {
-                let nonzero = lane(a, bytes, i) & lane(b, bytes, i) != 0;
+            with_width!(1 << imm8, N => (0..VECTOR_SIZE / N).fold(0, |mask, i| {
+                let nonzero = a.lane::<N>(i) & b.lane::<N>(i) != 0;
                 mask | ((nonzero == (op == op::TEST)) as u64) << i
-            })
+            }))
         }
         op::MOVEMASK_W => (0..32).fold(0, |mask, k| mask | (a.lane::<2>(k) >> 15) << k),
         op::MOVEMASK_D => (0..16).fold(0, |mask, k| mask | (a.lane::<4>(k) >> 31) << k),
@@ -2124,6 +2292,35 @@ pub(crate) fn execute_decoded<C: ContextObject>(
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Makes [missing_host_feature] return this feature
+        pub(super) static MISSING_HOST_FEATURE: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn test_host_without_features() {
+        use crate::{program::BuiltinProgram, static_analysis::DummyContextObject};
+        let new_loader = |enable_vector_ops| {
+            std::panic::catch_unwind(|| {
+                BuiltinProgram::<DummyContextObject>::new_loader(Config {
+                    enable_vector_ops,
+                    ..Config::default()
+                })
+            })
+            .is_ok()
+        };
+        MISSING_HOST_FEATURE.with(|feature| feature.set(Some("avx512vbmi2")));
+        assert!(matches!(
+            check_host_features(),
+            Err(EbpfError::UnsupportedHostFeatures("avx512vbmi2"))
+        ));
+        assert!(!new_loader(true));
+        assert!(new_loader(false));
+        MISSING_HOST_FEATURE.with(|feature| feature.set(None));
+        assert_eq!(new_loader(true), check_host_features().is_ok());
+    }
+
     #[test]
     fn test_op_table() {
         let mut seen = std::collections::HashSet::new();
@@ -2160,5 +2357,465 @@ mod tests {
             decode(encode_with_offset(op::SPLAT_D, 0, 2, 0, 0, 8)),
             Err("off must be 0")
         );
+    }
+
+    /// The reference semantics before the table-driven and word-at-a-time rewrite
+    mod old {
+        use super::super::*;
+
+        pub fn lane(v: &V, bytes: usize, i: usize) -> u64 {
+            let mut lane = [0u8; 8];
+            lane[..bytes].copy_from_slice(&v.0[i * bytes..(i + 1) * bytes]);
+            u64::from_le_bytes(lane)
+        }
+
+        pub fn set_lane(v: &mut V, bytes: usize, i: usize, value: u64) {
+            v.0[i * bytes..(i + 1) * bytes].copy_from_slice(&value.to_le_bytes()[..bytes]);
+        }
+
+        pub fn pick<'a>(bytes: usize, lanes: usize, f: impl Fn(usize) -> (&'a V, usize)) -> V {
+            let mut r = V::ZERO;
+            for i in 0..lanes {
+                let (v, k) = f(i);
+                set_lane(&mut r, bytes, i, lane(v, bytes, k));
+            }
+            r
+        }
+
+        pub fn narrow(x: &V, from: usize, to: usize, saturate: u8) -> V {
+            let bits = 8 * to as u32;
+            let mut r = V::ZERO;
+            for i in 0..VECTOR_SIZE / from {
+                let value = lane(x, from, i);
+                let value = match saturate {
+                    0 => value,
+                    1 => sat(
+                        sx(value, 8 * from as u32),
+                        -(1i64 << (bits - 1)),
+                        (1i64 << (bits - 1)) - 1,
+                    ),
+                    _ => value.min(u64::MAX >> (64 - bits)),
+                };
+                set_lane(&mut r, to, i, value);
+            }
+            r
+        }
+
+        pub fn extend(x: &V, from: usize, to: usize, signed: bool) -> V {
+            let mut r = V::ZERO;
+            for i in 0..VECTOR_SIZE / to {
+                let value = lane(x, from, i);
+                let value = if signed {
+                    sx(value, 8 * from as u32) as u64
+                } else {
+                    value
+                };
+                set_lane(&mut r, to, i, value);
+            }
+            r
+        }
+
+        pub fn clmul64(x: u64, y: u64) -> u128 {
+            (0..64)
+                .filter(|i| (y >> i) & 1 == 1)
+                .fold(0u128, |acc, i| acc ^ ((x as u128) << i))
+        }
+
+        pub fn gf_affine(a: u64, x: u8, c: u8) -> u8 {
+            (0..8).fold(c, |r, t| {
+                r ^ (((a >> (8 * (7 - t))) as u8 & x).count_ones() as u8 & 1) << t
+            })
+        }
+
+        pub fn aes_round(state: &V, key: &V, inverse: bool, last: bool) -> V {
+            let mut r = V::ZERO;
+            for l in 0..4 {
+                let s = &state.0[16 * l..16 * (l + 1)];
+                // (Inv)ShiftRows rotates row i by i columns, (Inv)SubBytes commutes with it
+                let mut t: [u8; 16] = std::array::from_fn(|k| {
+                    let (row, column) = (k % 4, k / 4);
+                    let from = if inverse {
+                        column + 4 - row
+                    } else {
+                        column + row
+                    } % 4;
+                    let x = s[row + 4 * from] as usize;
+                    if inverse {
+                        AES_INVERSE_SBOX[x]
+                    } else {
+                        AES_SBOX[x]
+                    }
+                });
+                if !last {
+                    let m = if inverse {
+                        [14, 11, 13, 9]
+                    } else {
+                        [2, 3, 1, 1]
+                    };
+                    for column in t.chunks_mut(4) {
+                        let x = [column[0], column[1], column[2], column[3]];
+                        for (row, y) in column.iter_mut().enumerate() {
+                            *y = (0..4).fold(0, |sum, j| sum ^ gf_mul(x[j], m[(j + 4 - row) % 4]));
+                        }
+                    }
+                }
+                for (k, x) in t.iter().enumerate() {
+                    r.0[16 * l + k] = x ^ key.0[16 * l + k];
+                }
+            }
+            r
+        }
+
+        pub fn apply_mask(info: &OpInfo, imm8: u8, mode: u8, old: &V, result: V, r2: u64) -> V {
+            if mode == 0 {
+                return result;
+            }
+            let bytes = info.mask_lane_bytes(imm8);
+            let mut r = result;
+            for i in 0..result_bytes(info.op, imm8) / bytes {
+                if (r2 >> i) & 1 == 0 {
+                    let value = if mode == 1 { lane(old, bytes, i) } else { 0 };
+                    set_lane(&mut r, bytes, i, value);
+                }
+            }
+            r
+        }
+
+        pub fn register_op(op: u8, imm8: u8, c: &V, a: &V, b: &V) -> Option<V> {
+            Some(match op {
+                op::NARROWUS_D_B | op::NARROWS_D_B | op::NARROWS_D_W | op::NARROW_D_B => {
+                    let mut r = V::ZERO;
+                    for k in 0..16 {
+                        let x = a.lane::<4>(k);
+                        match op {
+                            op::NARROWUS_D_B => r.set_lane::<1>(k, x.min(u8::MAX as u64)),
+                            op::NARROWS_D_B => {
+                                r.set_lane::<1>(k, sat(sx(x, 32), i8::MIN as i64, i8::MAX as i64))
+                            }
+                            op::NARROWS_D_W => {
+                                r.set_lane::<2>(k, sat(sx(x, 32), i16::MIN as i64, i16::MAX as i64))
+                            }
+                            _ => r.set_lane::<1>(k, x),
+                        }
+                    }
+                    r
+                }
+                op::NARROW_D_W => narrow(a, 4, 2, 0),
+                op::NARROWUS_D_W => narrow(a, 4, 2, 2),
+                op::NARROW_Q_B => narrow(a, 8, 1, 0),
+                op::NARROWS_Q_B => narrow(a, 8, 1, 1),
+                op::NARROWUS_Q_B => narrow(a, 8, 1, 2),
+                op::NARROW_Q_W => narrow(a, 8, 2, 0),
+                op::NARROWS_Q_W => narrow(a, 8, 2, 1),
+                op::NARROWUS_Q_W => narrow(a, 8, 2, 2),
+                op::NARROW_Q_D => narrow(a, 8, 4, 0),
+                op::NARROWS_Q_D => narrow(a, 8, 4, 1),
+                op::NARROWUS_Q_D => narrow(a, 8, 4, 2),
+                op::NARROW_W_B => narrow(a, 2, 1, 0),
+                op::NARROWS_W_B => narrow(a, 2, 1, 1),
+                op::NARROWUS_W_B => narrow(a, 2, 1, 2),
+                op::ZX_B_W => extend(a, 1, 2, false),
+                op::SX_B_W => extend(a, 1, 2, true),
+                op::ZX_B_Q => extend(a, 1, 8, false),
+                op::SX_B_Q => extend(a, 1, 8, true),
+                op::ZX_W_Q => extend(a, 2, 8, false),
+                op::SX_W_Q => extend(a, 2, 8, true),
+                op::CLMUL => {
+                    let mut r = V::ZERO;
+                    for l in 0..4 {
+                        let x = a.lane::<8>(2 * l + (imm8 & 1) as usize);
+                        let y = b.lane::<8>(2 * l + ((imm8 >> 4) & 1) as usize);
+                        let product = clmul64(x, y);
+                        r.set_lane::<8>(2 * l, product as u64);
+                        r.set_lane::<8>(2 * l + 1, (product >> 64) as u64);
+                    }
+                    r
+                }
+                op::PERM2I | op::PERM2T => {
+                    let bytes = 1 << imm8;
+                    let lanes = VECTOR_SIZE / bytes;
+                    // perm2i: the indices are in out, perm2t: out is the first table
+                    let (index, table) = if op == op::PERM2I { (c, a) } else { (a, c) };
+                    pick(bytes, lanes, |i| {
+                        let k = lane(index, bytes, i) as usize & (2 * lanes - 1);
+                        if k < lanes {
+                            (table, k)
+                        } else {
+                            (b, k - lanes)
+                        }
+                    })
+                }
+                op::ALIGNR => pick(1, 64, |i| {
+                    let j = (i & 15) + imm8 as usize;
+                    if j < 16 {
+                        (b, (i & !15) + j)
+                    } else if j < 32 {
+                        (a, (i & !15) + j - 16)
+                    } else {
+                        (&V::ZERO, 0)
+                    }
+                }),
+                op::BSHLI => pick(1, 64, |i| {
+                    if i & 15 >= imm8 as usize {
+                        (a, i - imm8 as usize)
+                    } else {
+                        (&V::ZERO, 0)
+                    }
+                }),
+                op::BSHRI => pick(1, 64, |i| {
+                    if (i & 15) + (imm8 as usize) < 16 {
+                        (a, i + imm8 as usize)
+                    } else {
+                        (&V::ZERO, 0)
+                    }
+                }),
+                op::UNPACKLO | op::UNPACKHI => {
+                    let bytes = 1 << imm8;
+                    let per_128 = 16 / bytes;
+                    let high = if op == op::UNPACKHI { per_128 / 2 } else { 0 };
+                    pick(bytes, VECTOR_SIZE / bytes, |i| {
+                        let (l, j) = (i / per_128, i % per_128);
+                        let source = if j % 2 == 0 { a } else { b };
+                        (source, l * per_128 + high + j / 2)
+                    })
+                }
+                op::GF2P8MUL => map2::<1>(a, b, |x, y| gf_mul(x as u8, y as u8) as u64),
+                op::GF2P8AFFINE | op::GF2P8AFFINEINV => {
+                    let mut r = V::ZERO;
+                    for k in 0..VECTOR_SIZE {
+                        let x = if op == op::GF2P8AFFINE {
+                            a.0[k]
+                        } else {
+                            GF_INVERSE[a.0[k] as usize]
+                        };
+                        r.0[k] = gf_affine(b.lane::<8>(k / 8), x, imm8);
+                    }
+                    r
+                }
+                op::AESENC => aes_round(a, b, false, false),
+                op::AESENCLAST => aes_round(a, b, false, true),
+                op::AESDEC => aes_round(a, b, true, false),
+                op::AESDECLAST => aes_round(a, b, true, true),
+                _ => return None,
+            })
+        }
+
+        pub fn mask_op(op: u8, imm8: u8, mode: u8, c: &V, a: &V, b: &V, r2: u64) -> Option<V> {
+            Some(match op {
+                op::BLENDM => {
+                    let bytes = 1 << imm8;
+                    let mut r = V::ZERO;
+                    for i in 0..VECTOR_SIZE / bytes {
+                        let source = if (r2 >> i) & 1 == 1 { b } else { a };
+                        set_lane(&mut r, bytes, i, lane(source, bytes, i));
+                    }
+                    r
+                }
+                op::COMPRESS | op::EXPAND => {
+                    let bytes = 1 << imm8;
+                    let mut r = if mode == 1 { *c } else { V::ZERO };
+                    let active = (0..VECTOR_SIZE / bytes).filter(|i| (r2 >> i) & 1 == 1);
+                    for (j, i) in active.enumerate() {
+                        if op == op::COMPRESS {
+                            set_lane(&mut r, bytes, j, lane(a, bytes, i));
+                        } else {
+                            set_lane(&mut r, bytes, i, lane(a, bytes, j));
+                        }
+                    }
+                    r
+                }
+                // bits, masks, compares
+                op::MOVM_B | op::MOVM_W | op::MOVM_D | op::MOVM_Q => {
+                    let bytes = 1 << (op - op::MOVM_B);
+                    let mut r = V::ZERO;
+                    for i in 0..VECTOR_SIZE / bytes {
+                        set_lane(&mut r, bytes, i, mask_of((r2 >> i) & 1 == 1));
+                    }
+                    r
+                }
+                _ => return None,
+            })
+        }
+
+        pub fn scalar_op(op: u8, imm8: u8, a: &V, b: &V) -> Option<u64> {
+            Some(match op {
+                op::CMP => {
+                    let bytes = 1 << ((imm8 >> 4) & 3);
+                    let bits = 8 * bytes as u32;
+                    let unsigned = (imm8 >> 3) & 1 == 1;
+                    (0..VECTOR_SIZE / bytes).fold(0, |mask, i| {
+                        let (x, y) = (lane(a, bytes, i), lane(b, bytes, i));
+                        let order = if unsigned {
+                            x.cmp(&y)
+                        } else {
+                            sx(x, bits).cmp(&sx(y, bits))
+                        };
+                        let condition = match imm8 & 7 {
+                            0 => order.is_eq(),
+                            1 => order.is_lt(),
+                            2 => order.is_le(),
+                            4 => order.is_ne(),
+                            5 => order.is_ge(),
+                            _ => order.is_gt(),
+                        };
+                        mask | (condition as u64) << i
+                    })
+                }
+                op::BITSHUF => (0..64).fold(0, |mask, i| {
+                    let bit = (a.lane::<8>(i / 8) >> (b.0[i] & 63)) & 1;
+                    mask | bit << i
+                }),
+                op::TEST | op::TESTN => {
+                    let bytes = 1 << imm8;
+                    (0..VECTOR_SIZE / bytes).fold(0, |mask, i| {
+                        let nonzero = lane(a, bytes, i) & lane(b, bytes, i) != 0;
+                        mask | ((nonzero == (op == op::TEST)) as u64) << i
+                    })
+                }
+                _ => return None,
+            })
+        }
+    }
+
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// Random bytes, with many 0x00, 0x7f, 0x80 and 0xff
+    fn random_register(next: &mut impl FnMut() -> u64) -> V {
+        VectorRegister(std::array::from_fn(|_| match next() % 8 {
+            0 => 0,
+            1 => 0x7f,
+            2 => 0x80,
+            3 => 0xff,
+            _ => next() as u8,
+        }))
+    }
+
+    #[test]
+    fn test_reference_ops_match_old() {
+        let mut next = rng(0x243f_6a88_85a3_08d3);
+        for info in OPS {
+            for imm8 in (0..=255).filter(|imm8| info.imm8_is_valid(*imm8)) {
+                for round in 0..4 {
+                    let (c, a, mut b) = (
+                        random_register(&mut next),
+                        random_register(&mut next),
+                        random_register(&mut next),
+                    );
+                    if round % 2 == 1 {
+                        for k in (0..VECTOR_SIZE).filter(|_| next() & 1 == 0) {
+                            b.0[k] = a.0[k];
+                        }
+                    }
+                    let r2 = next();
+                    let at = format!("{} imm8 {imm8:#x} round {round}", info.name);
+                    for mode in (0..3).filter(|mode| info.modes() & (1 << mode) != 0) {
+                        if let Some(want) = old::mask_op(info.op, imm8, mode, &c, &a, &b, r2) {
+                            let got = execute_mask_op(info.op, imm8, mode, &c, &a, &b, r2);
+                            assert_eq!(got, Some(want), "{at} mode {mode}");
+                        } else if let Some(result) = execute_register_op(info.op, imm8, &c, &a, &b)
+                        {
+                            let want =
+                                old::register_op(info.op, imm8, &c, &a, &b).unwrap_or(result);
+                            assert_eq!(
+                                apply_mask(info, imm8, mode, &c, result, r2),
+                                old::apply_mask(info, imm8, mode, &c, want, r2),
+                                "{at} mode {mode}"
+                            );
+                        }
+                    }
+                    if let Some(want) = old::scalar_op(info.op, imm8, &a, &b) {
+                        let got = execute_scalar_output_op(info.op, imm8, &a, &b, r2);
+                        assert_eq!(got, Some(want), "{at}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_reference_helpers_match_old() {
+        let mut next = rng(0x1319_8a2e_0370_7344);
+        for (x, y) in [
+            (0, 0),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 1),
+            (1 << 63, 1 << 63),
+        ] {
+            assert_eq!(clmul64(x, y), old::clmul64(x, y));
+        }
+        for _ in 0..1000 {
+            let (a, b) = (random_register(&mut next), random_register(&mut next));
+            let (x, y) = (next(), next());
+            assert_eq!(clmul64(x, y), old::clmul64(x, y), "{x:#x} {y:#x}");
+            let c = next() as u8;
+            let affine = gf_affine(x, y, c).to_le_bytes();
+            for (k, byte) in y.to_le_bytes().iter().enumerate() {
+                assert_eq!(affine[k], old::gf_affine(x, *byte, c));
+            }
+            let product = gf_mul_bytes(x, y).to_le_bytes();
+            let (xs, ys) = (x.to_le_bytes(), y.to_le_bytes());
+            for (k, byte) in product.iter().enumerate() {
+                assert_eq!(*byte, gf_mul(xs[k], ys[k]));
+            }
+            for (inverse, last) in [(false, false), (false, true), (true, false), (true, true)] {
+                assert_eq!(
+                    aes_round(&a, &b, inverse, last),
+                    old::aes_round(&a, &b, inverse, last)
+                );
+            }
+            for saturate in 0..3 {
+                assert_eq!(
+                    narrow::<2, 1>(&a, saturate),
+                    old::narrow(&a, 2, 1, saturate)
+                );
+                assert_eq!(
+                    narrow::<4, 2>(&a, saturate),
+                    old::narrow(&a, 4, 2, saturate)
+                );
+                assert_eq!(
+                    narrow::<4, 1>(&a, saturate),
+                    old::narrow(&a, 4, 1, saturate)
+                );
+                assert_eq!(
+                    narrow::<8, 1>(&a, saturate),
+                    old::narrow(&a, 8, 1, saturate)
+                );
+                assert_eq!(
+                    narrow::<8, 2>(&a, saturate),
+                    old::narrow(&a, 8, 2, saturate)
+                );
+                assert_eq!(
+                    narrow::<8, 4>(&a, saturate),
+                    old::narrow(&a, 8, 4, saturate)
+                );
+            }
+            for signed in [false, true] {
+                assert_eq!(extend::<1, 2>(&a, signed), old::extend(&a, 1, 2, signed));
+                assert_eq!(extend::<1, 8>(&a, signed), old::extend(&a, 1, 8, signed));
+                assert_eq!(extend::<2, 8>(&a, signed), old::extend(&a, 2, 8, signed));
+            }
+            for bytes in [1, 2, 4, 8] {
+                let lanes = VECTOR_SIZE / bytes;
+                let index: Vec<u64> = (0..lanes).map(|_| next()).collect();
+                let f = |i: usize| {
+                    let source = if index[i] & 1 == 1 { &a } else { &b };
+                    (source, (index[i] >> 1) as usize % lanes)
+                };
+                assert_eq!(pick(bytes, lanes, f), old::pick(bytes, lanes, f));
+                let mut mask = V::ZERO;
+                for i in 0..lanes {
+                    old::set_lane(&mut mask, bytes, i, mask_of((x >> i) & 1 == 1));
+                }
+                assert_eq!(lane_mask(bytes, x), mask);
+            }
+        }
     }
 }

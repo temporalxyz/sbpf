@@ -490,6 +490,11 @@ impl<C: ContextObject> PartialEq for BuiltinProgram<C> {
 impl<C: ContextObject> BuiltinProgram<C> {
     /// Constructs a loader built-in program
     pub fn new_loader(config: Config) -> Self {
+        if config.enable_vector_ops {
+            if let Err(err) = crate::vector::check_host_features() {
+                panic!("{}", err);
+            }
+        }
         Self {
             config: Some(Box::new(config)),
             sparse_registry: FunctionRegistry::default(),

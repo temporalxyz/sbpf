@@ -335,11 +335,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             0
         };
         if vector_registers_used != 0 {
-            if let Some(feature) = vector_jit::missing_host_feature() {
-                return Err(EbpfError::UnsupportedHostFeatures(feature));
-            }
+            // BuiltinProgram::new_loader checked the host
+            debug_assert!(crate::vector::missing_host_feature().is_none());
             code_length_estimate += vector_jit::MAX_VECTOR_SUBROUTINES_MACHINE_CODE_LENGTH;
             code_length_estimate += vector_jit::machine_code_length_estimate(program, executable.get_sbpf_version(), vector_registers_used);
+            if code_length_estimate >= i32::MAX as usize {
+                return Err(EbpfError::ExhaustedTextSegment(pc));
+            }
         }
         // Relative jump destinations limit the maximum output size
         debug_assert!(code_length_estimate < (i32::MAX as usize));
